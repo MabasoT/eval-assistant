@@ -131,6 +131,25 @@ manual action.
 
 ---
 
+## Customizing dimensions & issue taxonomy
+
+Click **⚙ Customize** in the header to open the config editor. You can:
+
+- **Worksheet dimensions** — rename, re-weight, add, or remove dimensions.
+  The bucket-mapping magnitude bands are tuned for the default total weight of
+  11, so if you change weights substantially the suggestion is still directionally
+  correct but you may want to recalibrate the bands in `src/scoring.js`.
+- **Issue taxonomy** — rename codes/labels/descriptions, add, or remove issue
+  codes. Edits apply to both LEFT and RIGHT. If you remove a code that was already
+  ticked, those selections are pruned automatically so they can't become hidden,
+  unfixable validation errors.
+
+Both lists are persisted to `localStorage`, and each has a **Reset defaults**
+button. The defaults live in `src/scoring.js` (`DEFAULT_DIMENSIONS`,
+`DEFAULT_TAXONOMY`).
+
+---
+
 ## Evidence anchoring
 
 Every ticked issue stores a **`evidence`** string alongside its `justification`:
@@ -212,6 +231,19 @@ automated evaluation.
 npm install
 npm run dev      # http://localhost:5173/eval-assistant/
 npm run build    # production bundle in dist/
+npm test         # unit tests for the scoring engine (node --test)
+```
+
+## Tests
+
+The pure scoring logic lives in `src/scoring.js` (no React/DOM/storage), which
+makes it directly unit-testable. `src/scoring.test.js` covers `weightedTotal`,
+`worksheetComplete`, `blankWorksheet`, and the full `suggestBucket` mapping
+(including the documented `41 vs 33 → 2` example and the magnitude-band
+boundaries) using Node's built-in test runner — **no extra dependencies**.
+
+```bash
+npm test
 ```
 
 ## Deploy
@@ -236,6 +268,8 @@ npm run build
 
 ## Tech
 
-Vite + React 19. Single-file app (`src/App.jsx`), inline styles, no external UI
-libraries. State persists to `localStorage` (current draft + history of the last
-50 evaluations). No network, AI, or telemetry calls.
+Vite + React 19. The UI is a single component file (`src/App.jsx`) with inline
+styles and no external UI libraries; the pure scoring engine is factored out into
+`src/scoring.js` (and tested in `src/scoring.test.js`). State persists to
+`localStorage` (current draft, editable config, and history of the last 50
+evaluations). No network, AI, or telemetry calls.

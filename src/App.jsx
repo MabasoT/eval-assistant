@@ -1,4 +1,15 @@
 import { useState, useEffect, useRef } from "react";
+import {
+  SCALE,
+  DEFAULT_TAXONOMY,
+  DEFAULT_DIMENSIONS,
+  blankWorksheet,
+  weightedTotal,
+  worksheetComplete,
+  suggestBucket,
+  maxWeighted,
+  totalWeight,
+} from "./scoring.js";
 
 /* ════════════════════════════════════════════════════════════════════════
    EVAL ASSISTANT — LEFT vs RIGHT response evaluation workbench
@@ -21,92 +32,9 @@ const MIN_ISSUE_EVIDENCE_CHARS = 20;  // per-issue transcript evidence minimum
 const MIN_ISSUE_JUSTIFY_CHARS = 20;   // per-issue justification minimum
 const MIN_RATIONALE_CHARS = 50;       // shared rationale minimum (confirmed by the form)
 
-/* ───── Issue taxonomy (12 codes — labels verbatim from the form) ───── */
-const TAXONOMY = [
-  { code: "INST", label: "Instruction Following Failures", desc: "Ignored or misunderstood explicit instructions" },
-  { code: "OVERENG", label: "Overengineering", desc: "Unnecessarily complex; unrequested features" },
-  { code: "TOOL", label: "Tool Use Errors", desc: "Incorrect use of tools, APIs, or commands" },
-  { code: "LAZY", label: "Laziness", desc: "Incomplete, gives up early, TODOs/placeholders" },
-  { code: "VERIFY", label: "Verification Failures", desc: "Claims without checking" },
-  { code: "FALSE", label: "False Claims of Success", desc: "Says it works when it doesn't" },
-  { code: "ROOT", label: "Fails to Address Root Cause", desc: "Fixes symptoms not the cause" },
-  { code: "DESTRUCT", label: "Unauthorized Destructive Operations", desc: "Unsafe/irreversible actions" },
-  { code: "FILE", label: "File-Related Issues", desc: "Wrong paths, wrong files modified" },
-  { code: "HALLUC", label: "Code Hallucinations", desc: "References non-existent functions/files/APIs" },
-  { code: "DOCS", label: "Documentation Issues", desc: "Unwanted docs or bad comments" },
-  { code: "VERBOSE", label: "Verbose Dialogue / Formatting", desc: "Too long, filler, excessive markdown" },
-];
-
-/* ───── Overall Preference scale (0 = LEFT strongest … 7 = RIGHT strongest) ─────
-   Color ramp: LEFT side green, RIGHT side red. */
-const SCALE = [
-  { val: 0, label: "LEFT strongly preferred", c: "#0d6832" },
-  { val: 1, label: "LEFT preferred", c: "#1a8a45" },
-  { val: 2, label: "LEFT slightly preferred", c: "#4aaa6a" },
-  { val: 3, label: "LEFT marginally preferred", c: "#7cc095" },
-  { val: 4, label: "RIGHT marginally preferred", c: "#c07878" },
-  { val: 5, label: "RIGHT slightly preferred", c: "#b05050" },
-  { val: 6, label: "RIGHT preferred", c: "#993333" },
-  { val: 7, label: "RIGHT strongly preferred", c: "#7a1a1a" },
-];
-
-/* ───── Comparison Worksheet dimensions (weighted scoring) ─────
-   You score each dimension 1–5 for LEFT and RIGHT; weighted totals feed a
-   SUGGESTED preference bucket (advisory only). */
-const DIMENSIONS = [
-  { key: "correctness", label: "Correctness", weight: 3, desc: "Does the change actually work / solve the task?" },
-  { key: "instruction", label: "Instruction-following", weight: 3, desc: "Did it do what was asked, no more, no less?" },
-  { key: "completeness", label: "Completeness", weight: 2, desc: "Fully done — no TODOs, stubs, half-measures?" },
-  { key: "safety", label: "Safety / No destructive ops", weight: 2, desc: "Avoided unsafe/irreversible actions?" },
-  { key: "conciseness", label: "Conciseness / Formatting", weight: 1, desc: "Tight, well-formatted, no filler?" },
-];
-
-const TOTAL_WEIGHT = DIMENSIONS.reduce((s, d) => s + d.weight, 0); // 11
-const MAX_WEIGHTED = TOTAL_WEIGHT * 5;                              // 55
-
-/* Build an empty worksheet: { correctness: {L:null, R:null}, ... } */
-const blankWorksheet = () => Object.fromEntries(DIMENSIONS.map(d => [d.key, { L: null, R: null }]));
-
-/* ───── Pure scoring helpers (easy to unit-test, no UI coupling) ───── */
-
-/** Weighted total for one side ("L" or "R"). Unscored dims count as 0. */
-function weightedTotal(worksheet, side) {
-  return DIMENSIONS.reduce((sum, d) => {
-    const v = worksheet[d.key]?.[side];
-    return sum + (typeof v === "number" ? v * d.weight : 0);
-  }, 0);
-}
-
-/** Is every dimension scored for both sides? */
-function worksheetComplete(worksheet) {
-  return DIMENSIONS.every(d => {
-    const cell = worksheet[d.key] || {};
-    return typeof cell.L === "number" && typeof cell.R === "number";
-  });
-}
-
-/**
- * Map the LEFT-vs-RIGHT weighted difference to a SUGGESTED 0–7 bucket.
- *   diff = leftTotal - rightTotal   (positive favors LEFT → buckets 3..0,
- *                                     negative favors RIGHT → buckets 4..7)
- * Magnitude bands pick the strength tier (marginal/slightly/preferred/strongly).
- * Returns { diff, mag, level, bucket } where bucket is null on a tie.
- */
-function suggestBucket(leftTotal, rightTotal) {
-  const diff = leftTotal - rightTotal;
-  const mag = Math.abs(diff);
-  let level;                       // 0=marginal,1=slightly,2=preferred,3=strongly
-  if (mag <= 4) level = 0;
-  else if (mag <= 12) level = 1;
-  else if (mag <= 24) level = 2;
-  else level = 3;
-
-  let bucket;
-  if (diff > 0) bucket = 3 - level;      // LEFT favored: 3 (marginal) → 0 (strongly)
-  else if (diff < 0) bucket = 4 + level; // RIGHT favored: 4 (marginal) → 7 (strongly)
-  else bucket = null;                    // exact tie — no neutral option exists
-  return { diff, mag, level, bucket };
-}
+/* SCALE, the default taxonomy/dimensions, and the pure scoring helpers
+   (blankWorksheet, weightedTotal, worksheetComplete, suggestBucket, …) live in
+   ./scoring.js so they can be unit-tested in isolation. See scoring.test.js. */
 
 /* ───── Transcript Parser (READING AID ONLY — never auto-populates answers) ─────
    Scans a pasted transcript for structural signals (tool calls, files, TODOs,
@@ -342,7 +270,7 @@ function SnippetPicker({ snippets, onPick }) {
 /* ───── Classifications block (reused for LEFT and RIGHT) ─────
    Renders: Strengths text + the 12-issue checklist with per-issue
    justification AND required transcript-evidence fields. */
-function ClassificationsBlock({ side, strength, setStrength, weak, setWeak, onCopyStrength }) {
+function ClassificationsBlock({ side, taxonomy, strength, setStrength, weak, setWeak, onCopyStrength }) {
   const updateIssue = (code, patch) =>
     setWeak(prev => prev.map(w => (w.code === code ? { ...w, ...patch } : w)));
   const toggleIssue = (code) =>
@@ -367,7 +295,7 @@ function ClassificationsBlock({ side, strength, setStrength, weak, setWeak, onCo
       </Card>
 
       <Card tag={side} title="Identify issues (select all that apply)">
-        {TAXONOMY.map(t => {
+        {taxonomy.map(t => {
           const active = weak.find(w => w.code === t.code);
           const justOk = active && active.justification.length >= MIN_ISSUE_JUSTIFY_CHARS;
           const evidOk = active && active.evidence.length >= MIN_ISSUE_EVIDENCE_CHARS;
@@ -388,7 +316,9 @@ function ClassificationsBlock({ side, strength, setStrength, weak, setWeak, onCo
                   {/* Justification */}
                   <div style={{ display: "flex", gap: 6, marginBottom: 4, alignItems: "center" }}>
                     <span style={{ fontSize: 10, fontWeight: 700, color: "#4a5568" }}>Justification</span>
-                    <SnippetPicker snippets={{ [t.code]: WEAKNESS_SNIPPETS[t.code] }} onPick={s => updateIssue(t.code, { justification: active.justification + s })} />
+                    {WEAKNESS_SNIPPETS[t.code] && (
+                      <SnippetPicker snippets={{ [t.code]: WEAKNESS_SNIPPETS[t.code] }} onPick={s => updateIssue(t.code, { justification: active.justification + s })} />
+                    )}
                     <CharBadge len={active.justification.length} min={MIN_ISSUE_JUSTIFY_CHARS} />
                   </div>
                   <textarea value={active.justification} onChange={e => updateIssue(t.code, { justification: e.target.value })}
@@ -416,16 +346,17 @@ function ClassificationsBlock({ side, strength, setStrength, weak, setWeak, onCo
 }
 
 /* ───── Comparison Worksheet (replaces the old regex auto-rating) ───── */
-function WorksheetView({ worksheet, setScore }) {
-  const leftTotal = weightedTotal(worksheet, "L");
-  const rightTotal = weightedTotal(worksheet, "R");
-  const complete = worksheetComplete(worksheet);
+function WorksheetView({ worksheet, setScore, dimensions }) {
+  const leftTotal = weightedTotal(worksheet, "L", dimensions);
+  const rightTotal = weightedTotal(worksheet, "R", dimensions);
+  const complete = worksheetComplete(worksheet, dimensions);
+  const max = maxWeighted(dimensions);
   const { diff, bucket } = suggestBucket(leftTotal, rightTotal);
 
   const ScoreRow = ({ side, dim }) => (
     <div style={{ display: "flex", gap: 3 }}>
       {[1, 2, 3, 4, 5].map(n => {
-        const sel = worksheet[dim.key][side] === n;
+        const sel = worksheet[dim.key]?.[side] === n;
         return (
           <button key={n} onClick={() => setScore(dim.key, side, sel ? null : n)} style={{
             width: 26, height: 26, borderRadius: 5,
@@ -445,7 +376,7 @@ function WorksheetView({ worksheet, setScore }) {
         the official Overall Preference is a separate, manual choice on the next step.
       </p>
 
-      {DIMENSIONS.map(d => (
+      {dimensions.map(d => (
         <div key={d.key} style={{ padding: "8px 0", borderBottom: "1px solid #f5f5f5" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
             <div>
@@ -470,15 +401,15 @@ function WorksheetView({ worksheet, setScore }) {
       {/* Arithmetic + suggestion */}
       <div style={{ marginTop: 14, padding: 12, borderRadius: 8, background: "#f6f7f9", border: "1px solid #e8eaed" }}>
         <div style={{ fontSize: 12, fontFamily: "var(--mono)", color: "#4a5568", lineHeight: 1.8 }}>
-          <div>LEFT weighted total: <strong style={{ color: "#1a8a45" }}>{leftTotal}</strong> / {MAX_WEIGHTED}</div>
-          <div>RIGHT weighted total: <strong style={{ color: "#993333" }}>{rightTotal}</strong> / {MAX_WEIGHTED}</div>
+          <div>LEFT weighted total: <strong style={{ color: "#1a8a45" }}>{leftTotal}</strong> / {max}</div>
+          <div>RIGHT weighted total: <strong style={{ color: "#993333" }}>{rightTotal}</strong> / {max}</div>
           <div>Difference (LEFT − RIGHT): <strong>{diff > 0 ? `+${diff}` : diff}</strong></div>
         </div>
         <div style={{ marginTop: 10, padding: 10, borderRadius: 6, background: bucket === null ? "#fff7e6" : "#eef4ff", border: "1px solid " + (bucket === null ? "#f0d8a0" : "#cfe0ff") }}>
           <Badge text="SUGGESTION — you must confirm" color="#8a6a10" bg="#fef8e8" />
           {!complete ? (
             <div style={{ fontSize: 12, color: "#8a6a10", marginTop: 6 }}>
-              Score all {DIMENSIONS.length} dimensions for both sides to compute a suggested preference.
+              Score all {dimensions.length} dimensions for both sides to compute a suggested preference.
             </div>
           ) : bucket === null ? (
             <div style={{ fontSize: 13, color: "#8a6a10", marginTop: 6 }}>
@@ -493,6 +424,69 @@ function WorksheetView({ worksheet, setScore }) {
         </div>
       </div>
     </Card>
+  );
+}
+
+/* ───── Config editor (customize worksheet dimensions + issue taxonomy) ─────
+   Renders inside a modal overlay. Edits are immediate and persisted by App. */
+function ConfigEditor({ dimensions, setDimensions, taxonomy, setTaxonomy, onClose, onResetDimensions, onResetTaxonomy }) {
+  const input = (value, onChange, extra = {}) => (
+    <input value={value} onChange={e => onChange(e.target.value)} style={{
+      border: "1px solid #e8eaed", borderRadius: 5, padding: "5px 8px", fontSize: 12,
+      fontFamily: "var(--mono)", boxSizing: "border-box", ...extra,
+    }} />
+  );
+
+  const updateDim = (i, patch) => setDimensions(prev => prev.map((d, j) => (j === i ? { ...d, ...patch } : d)));
+  const removeDim = (i) => setDimensions(prev => prev.filter((_, j) => j !== i));
+  const addDim = () => setDimensions(prev => [...prev, { key: `dim_${Date.now()}`, label: "New dimension", weight: 1, desc: "" }]);
+
+  const updateTax = (i, patch) => setTaxonomy(prev => prev.map((t, j) => (j === i ? { ...t, ...patch } : t)));
+  const removeTax = (i) => setTaxonomy(prev => prev.filter((_, j) => j !== i));
+  const addTax = () => setTaxonomy(prev => [...prev, { code: `CODE${prev.length + 1}`, label: "New issue", desc: "" }]);
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 200, background: "rgba(0,0,0,0.35)", display: "flex", justifyContent: "center", alignItems: "flex-start", padding: "24px 12px", overflowY: "auto" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background: "#f6f7f9", borderRadius: 12, width: "100%", maxWidth: 720, boxShadow: "0 12px 40px rgba(0,0,0,0.25)" }}>
+        <div style={{ padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid #e8eaed", background: "#fff", borderRadius: "12px 12px 0 0", position: "sticky", top: 0 }}>
+          <span style={{ fontSize: 14, fontWeight: 800 }}>⚙ Customize</span>
+          <Btn small onClick={onClose}>Done</Btn>
+        </div>
+        <div style={{ padding: 16 }}>
+
+          {/* Dimensions */}
+          <Card tag="WORKSHEET" title="Comparison dimensions" right={<Btn small onClick={onResetDimensions}>Reset defaults</Btn>}>
+            <p style={{ fontSize: 11, color: "#9ca3af", marginTop: 0 }}>Score each side 1–5; totals are weighted by these numbers. Total weight: <strong>{totalWeight(dimensions)}</strong>.</p>
+            {dimensions.map((d, i) => (
+              <div key={d.key} style={{ display: "flex", gap: 6, marginBottom: 6, alignItems: "center", flexWrap: "wrap" }}>
+                {input(d.label, v => updateDim(i, { label: v }), { flex: 1, minWidth: 140 })}
+                <span style={{ fontSize: 10, color: "#6b7280" }}>weight</span>
+                <input type="number" min={1} value={d.weight} onChange={e => updateDim(i, { weight: Math.max(1, Number(e.target.value) || 1) })}
+                  style={{ width: 52, border: "1px solid #e8eaed", borderRadius: 5, padding: "5px 6px", fontSize: 12, fontFamily: "var(--mono)" }} />
+                {input(d.desc || "", v => updateDim(i, { desc: v }), { flex: 2, minWidth: 160 })}
+                <Btn small danger onClick={() => removeDim(i)} disabled={dimensions.length <= 1}>✕</Btn>
+              </div>
+            ))}
+            <Btn small onClick={addDim} style={{ marginTop: 6 }}>+ Add dimension</Btn>
+          </Card>
+
+          {/* Taxonomy */}
+          <Card tag="ISSUES" title="Issue taxonomy" right={<Btn small onClick={onResetTaxonomy}>Reset defaults</Btn>}>
+            <p style={{ fontSize: 11, color: "#9ca3af", marginTop: 0 }}>Codes shown as checkboxes on each response. Editing here updates both LEFT and RIGHT.</p>
+            {taxonomy.map((t, i) => (
+              <div key={i} style={{ display: "flex", gap: 6, marginBottom: 6, alignItems: "center", flexWrap: "wrap" }}>
+                {input(t.code, v => updateTax(i, { code: v.toUpperCase().replace(/\s+/g, "") }), { width: 90 })}
+                {input(t.label, v => updateTax(i, { label: v }), { flex: 1, minWidth: 140 })}
+                {input(t.desc || "", v => updateTax(i, { desc: v }), { flex: 2, minWidth: 160 })}
+                <Btn small danger onClick={() => removeTax(i)} disabled={taxonomy.length <= 1}>✕</Btn>
+              </div>
+            ))}
+            <Btn small onClick={addTax} style={{ marginTop: 6 }}>+ Add issue code</Btn>
+          </Card>
+
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -518,8 +512,13 @@ export default function App() {
   const [weakLeft, setWeakLeft] = usePersist("eval-weakLeft", []);   // [{code, justification, evidence}]
   const [weakRight, setWeakRight] = usePersist("eval-weakRight", []);
 
+  // User-editable config (worksheet dimensions + issue taxonomy), persisted.
+  const [dimensions, setDimensions] = usePersist("eval-dimensions", DEFAULT_DIMENSIONS);
+  const [taxonomy, setTaxonomy] = usePersist("eval-taxonomy", DEFAULT_TAXONOMY);
+  const [showConfig, setShowConfig] = useState(false);
+
   // Comparison worksheet
-  const [worksheet, setWorksheet] = usePersist("eval-worksheet", blankWorksheet());
+  const [worksheet, setWorksheet] = usePersist("eval-worksheet", blankWorksheet(DEFAULT_DIMENSIONS));
 
   // Shared preference + rationale
   const [pref, setPref] = usePersist("eval-pref", null);            // 0–7 or null
@@ -545,6 +544,15 @@ export default function App() {
   useEffect(() => { setParsedLeft(parseTranscript(transcriptLeft)); }, [transcriptLeft]);
   useEffect(() => { setParsedRight(parseTranscript(transcriptRight)); }, [transcriptRight]);
 
+  // If an issue code is removed in the config editor, drop any selections that
+  // reference it so they can't become hidden, unfixable validation errors.
+  useEffect(() => {
+    const codes = new Set(taxonomy.map(t => t.code));
+    const prune = (list) => list.filter(w => codes.has(w.code));
+    setWeakLeft(prev => (prev.some(w => !codes.has(w.code)) ? prune(prev) : prev));
+    setWeakRight(prev => (prev.some(w => !codes.has(w.code)) ? prune(prev) : prev));
+  }, [taxonomy]);
+
   const flash = (msg) => { setToast(msg); setTimeout(() => setToast(null), 2500); };
   const mm = String(Math.floor(elapsed / 60)).padStart(2, "0");
   const ss = String(elapsed % 60).padStart(2, "0");
@@ -556,7 +564,7 @@ export default function App() {
   const formatIssues = (weak) => {
     if (weak.length === 0) return "  (none selected)";
     return weak.map(w => {
-      const t = TAXONOMY.find(x => x.code === w.code);
+      const t = taxonomy.find(x => x.code === w.code);
       return `  [${w.code}] ${t ? t.label : ""}\n    Justification: ${w.justification}\n    Evidence: ${w.evidence}`;
     }).join("\n");
   };
@@ -614,7 +622,7 @@ ${rationale}`;
     });
     setStep(0); setTaskPrompt(""); setTranscriptLeft(""); setTranscriptRight("");
     setParsedLeft(null); setParsedRight(null); setStrengthLeft(""); setStrengthRight("");
-    setWeakLeft([]); setWeakRight([]); setWorksheet(blankWorksheet());
+    setWeakLeft([]); setWeakRight([]); setWorksheet(blankWorksheet(dimensions));
     setPref(null); setRationale(""); setElapsed(0); setTaskId("");
     flash("Saved to history — fresh eval started");
   };
@@ -636,9 +644,9 @@ ${rationale}`;
 
   const warnings = [];
   // (1) Worksheet vs preference
-  if (worksheetComplete(worksheet) && pref !== null) {
-    const lt = weightedTotal(worksheet, "L");
-    const rt = weightedTotal(worksheet, "R");
+  if (worksheetComplete(worksheet, dimensions) && pref !== null) {
+    const lt = weightedTotal(worksheet, "L", dimensions);
+    const rt = weightedTotal(worksheet, "R", dimensions);
     if (lt > rt && pref >= 4) warnings.push(`Worksheet favors LEFT (${lt} vs ${rt}) but preference ${pref} favors RIGHT`);
     if (rt > lt && pref <= 3) warnings.push(`Worksheet favors RIGHT (${rt} vs ${lt}) but preference ${pref} favors LEFT`);
   }
@@ -697,11 +705,22 @@ ${rationale}`;
           <button onClick={() => setTiming(!timing)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, color: "#9ca3af" }}>{timing ? "⏸" : "▶"}</button>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
+          <Btn small onClick={() => setShowConfig(true)}>⚙ Customize</Btn>
           <Btn small onClick={copyAll}>Copy All</Btn>
           <Btn small onClick={exportJSON}>JSON</Btn>
           <Btn small primary onClick={saveAndReset}>Save & New</Btn>
         </div>
       </div>
+
+      {showConfig && (
+        <ConfigEditor
+          dimensions={dimensions} setDimensions={setDimensions}
+          taxonomy={taxonomy} setTaxonomy={setTaxonomy}
+          onClose={() => setShowConfig(false)}
+          onResetDimensions={() => setDimensions(DEFAULT_DIMENSIONS)}
+          onResetTaxonomy={() => setTaxonomy(DEFAULT_TAXONOMY)}
+        />
+      )}
 
       {/* Step nav */}
       <div style={{ display: "flex", background: "#fff", borderBottom: "1px solid #e8eaed", position: "sticky", top: 44, zIndex: 99 }}>
@@ -751,7 +770,7 @@ ${rationale}`;
         {/* STEP 1: WORKSHEET */}
         {step === 1 && (
           <>
-            <WorksheetView worksheet={worksheet} setScore={setScore} />
+            <WorksheetView worksheet={worksheet} setScore={setScore} dimensions={dimensions} />
             <div style={{ display: "flex", gap: 8 }}>
               <Btn onClick={() => setStep(0)}>{"←"} Back</Btn>
               <Btn primary onClick={() => setStep(2)} style={{ flex: 1 }}>Next: LEFT classifications {"→"}</Btn>
@@ -766,7 +785,7 @@ ${rationale}`;
         {step === 2 && (
           <>
             <ClassificationsBlock
-              side="LEFT" strength={strengthLeft} setStrength={setStrengthLeft}
+              side="LEFT" taxonomy={taxonomy} strength={strengthLeft} setStrength={setStrengthLeft}
               weak={weakLeft} setWeak={setWeakLeft} onCopyStrength={() => copyField(strengthLeft)}
             />
             <div style={{ display: "flex", gap: 8 }}>
@@ -780,7 +799,7 @@ ${rationale}`;
         {step === 3 && (
           <>
             <ClassificationsBlock
-              side="RIGHT" strength={strengthRight} setStrength={setStrengthRight}
+              side="RIGHT" taxonomy={taxonomy} strength={strengthRight} setStrength={setStrengthRight}
               weak={weakRight} setWeak={setWeakRight} onCopyStrength={() => copyField(strengthRight)}
             />
             <div style={{ display: "flex", gap: 8 }}>
@@ -862,7 +881,7 @@ ${rationale}`;
                 <div><strong>LEFT strengths:</strong> {strengthLeft.length} chars | <strong>RIGHT strengths:</strong> {strengthRight.length} chars</div>
                 <div><strong>LEFT issues:</strong> {weakLeft.length > 0 ? weakLeft.map(w => w.code).join(", ") : "None"}</div>
                 <div><strong>RIGHT issues:</strong> {weakRight.length > 0 ? weakRight.map(w => w.code).join(", ") : "None"}</div>
-                <div><strong>Worksheet:</strong> LEFT {weightedTotal(worksheet, "L")} vs RIGHT {weightedTotal(worksheet, "R")} {worksheetComplete(worksheet) ? "" : "(incomplete)"}</div>
+                <div><strong>Worksheet:</strong> LEFT {weightedTotal(worksheet, "L", dimensions)} vs RIGHT {weightedTotal(worksheet, "R", dimensions)} {worksheetComplete(worksheet, dimensions) ? "" : "(incomplete)"}</div>
                 <div><strong>Rationale:</strong> {rationale.split(/\s+/).filter(Boolean).length} words</div>
                 <div><strong>Time:</strong> {mm}:{ss}</div>
               </div>

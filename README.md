@@ -5,9 +5,67 @@ on repo-based coding tasks. It mirrors the Labelbox evaluation form **1:1** so y
 can fill the tool, hit **Copy All**, and paste straight into the form — while it
 quietly catches inconsistencies before you submit.
 
-Built with Vite + React, a single component file (`src/App.jsx`), inline styles,
-no UI libraries, and **zero network/AI/telemetry calls**. Everything runs locally
-and persists to `localStorage`.
+Built with Vite + React, inline styles, no UI libraries, and **no telemetry**.
+The form, the heuristic engine, and persistence are fully local. An **optional,
+off-by-default AI Judge** can call a model endpoint you configure — nothing else
+touches the network.
+
+---
+
+## Intelligence: a three-layer engine
+
+The tool separates *gathering evidence* from *judging*, because only the last
+layer can actually tell a correct algorithm from a subtly broken one.
+
+| Layer | File | Cost | What it does | Ceiling |
+|---|---|---|---|---|
+| **1. Evidence parser** | `scoring.js` `parseTranscript()` | free, deterministic | Format-aware extraction of edits, tests, validation, placeholders, churn, errors. | Structure only |
+| **2. Heuristic suggestion** | `scoring.js` `analyzePair()` | free, deterministic | Pluggable **detector** framework. Generic detectors generalize; domain packs (e.g. `PANDAS_DETECTORS`) are opt-in. Refuses to over-rank when the lead is only "thoroughness," not correctness. | Can't read semantics |
+| **3. LLM-as-judge** | `judge.js` `runJudge()` | your model | Asks a real model to read both diffs. **Position-swap** debiasing + **self-consistency** + forced evidence + per-criterion scoring + **calibrated abstention**. | A frontier model |
+
+**Why three layers.** A regex can flag a `TODO`; it cannot know an `indexOf(x)===i+1`
+is off-by-one. Layer 3 is the only one that judges correctness — but it costs money
+and can be biased, so layers 1–2 give you a free, instant, honest baseline and the
+judge is opt-in.
+
+### The engine is data, not branches
+
+A detector (layer 2) and the judge rubric (layer 3) are both **plug-in data**:
+
+```js
+// Add domain intelligence without touching the core:
+analyzePair(left, right, { detectors: [...GENERIC_DETECTORS, ...PANDAS_DETECTORS] });
+
+// The judge is provider-agnostic — inject any model:
+import { runJudge, openAiCompatibleAdapter } from "./judge.js";
+const model = openAiCompatibleAdapter({ endpoint, apiKey, model: "…" }); // Ollama / OpenAI / your proxy
+const verdict = await runJudge({ task, leftText, rightText, model, samples: 3, swapPositions: true });
+```
+
+### How the bias is removed (layer 3)
+
+- **Position-swap.** Each comparison runs in *both* orderings (A=LEFT, then A=RIGHT)
+  and is averaged. A purely position-biased judge collapses to **abstain** — there's
+  a unit test that proves exactly this.
+- **Self-consistency.** Sample N times; agreement drives confidence.
+- **Evidence + decomposition.** The model must quote lines and score
+  correctness/completeness/instruction/safety separately (kills halo bias).
+- **Calibrated abstention.** Disagreement or a tiny margin ⇒ "escalate to human,"
+  not a guess.
+
+### Honest accuracy
+
+This is not, and cannot be, a 100% oracle — true correctness of arbitrary code is
+undecidable, and subtle bugs can pass existing tests. With a strong model + the
+debiasing above you reach the **~85–95% agreement** band that production LLM-judge
+systems actually achieve, *with a calibrated abstain* instead of a confident wrong
+answer. Layers 1–2 never claim correctness they can't see.
+
+### Tested
+
+`npm test` (Node's built-in runner, no deps) covers all three layers, including a
+real Koalas eval, a hard adversarial JS example, and the position-bias-neutralized
+abstain. CI runs the suite before every deploy.
 
 ---
 

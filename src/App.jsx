@@ -12,6 +12,7 @@ import {
   parseTranscript,
   analyzePair,
 } from "./scoring.js";
+import { runJudge, openAiCompatibleAdapter } from "./judge.js";
 
 /* ════════════════════════════════════════════════════════════════════════
    EVAL ASSISTANT — LEFT vs RIGHT response evaluation workbench
@@ -218,6 +219,111 @@ function SuggestionCard({ left, right }) {
         </div>
       ) : (
         <p style={{ fontSize: 12, color: "#9ca3af", margin: 0 }}>Paste both transcripts on the Paste step first.</p>
+      )}
+    </Card>
+  );
+}
+
+/* ───── AI Judge (LLM-as-judge) — bring your own model endpoint ─────
+   This is the layer that can tell a correct algorithm from a subtly broken one.
+   It is OFF by default and never auto-fills the form. It runs the position-swap
+   + self-consistency engine in judge.js against ANY OpenAI-compatible endpoint
+   (Ollama at localhost works from the browser; hosted models need your own proxy
+   because of CORS / key safety). Your key is held in memory only — never stored. */
+function JudgePanel({ task, left, right, evidence }) {
+  const [open, setOpen] = useState(false);
+  const [endpoint, setEndpoint] = usePersist("eval-judge-endpoint", "http://localhost:11434/v1/chat/completions");
+  const [model, setModel] = usePersist("eval-judge-model", "qwen2.5-coder:7b");
+  const [apiKey, setApiKey] = useState(""); // in-memory only, never persisted
+  const [samples, setSamples] = useState(1);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [res, setRes] = useState(null);
+
+  const ready = left.trim() && right.trim() && endpoint.trim() && model.trim();
+
+  const run = async () => {
+    setBusy(true); setErr(null); setRes(null);
+    try {
+      const adapter = openAiCompatibleAdapter({ endpoint, apiKey: apiKey || undefined, model });
+      const r = await runJudge({ task, leftText: left, rightText: right, evidence, model: adapter, samples, swapPositions: true });
+      setRes(r);
+    } catch (e) {
+      setErr(String((e && e.message) || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const inp = { padding: "5px 8px", borderRadius: 6, border: "1px solid #e8eaed", fontSize: 11, fontFamily: "var(--mono)", background: "#fafbfc", boxSizing: "border-box" };
+
+  return (
+    <Card tag="AI JUDGE" title="LLM-as-judge (correctness, debiased)" right={
+      <Btn small onClick={() => setOpen(o => !o)}>{open ? "Hide" : "Set up"}</Btn>
+    }>
+      {!open ? (
+        <p style={{ fontSize: 11.5, color: "#6b7280", margin: 0 }}>
+          The only layer that can catch a subtly broken algorithm — it asks a real model to read both diffs. Runs each comparison in BOTH orderings (cancels position bias) and can sample N times (self-consistency). Abstains when the model is unsure. Bring your own endpoint; your key stays in memory.
+        </p>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+            <label style={{ fontSize: 10, color: "#6b7280" }}>Endpoint (OpenAI-compatible)
+              <input value={endpoint} onChange={e => setEndpoint(e.target.value)} style={{ ...inp, width: "100%" }} />
+            </label>
+            <label style={{ fontSize: 10, color: "#6b7280" }}>Model
+              <input value={model} onChange={e => setModel(e.target.value)} style={{ ...inp, width: "100%" }} />
+            </label>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 6 }}>
+            <label style={{ fontSize: 10, color: "#6b7280" }}>API key (optional; in-memory only — not for shared machines)
+              <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="leave blank for local Ollama" style={{ ...inp, width: "100%" }} />
+            </label>
+            <label style={{ fontSize: 10, color: "#6b7280" }}>Samples (self-consistency)
+              <input type="number" min={1} max={5} value={samples} onChange={e => setSamples(Math.max(1, Math.min(5, Number(e.target.value) || 1)))} style={{ ...inp, width: "100%" }} />
+            </label>
+          </div>
+          <Btn primary disabled={!ready || busy} onClick={run}>
+            {busy ? "Judging (2 orderings × samples)…" : ready ? "Run AI Judge" : "Paste transcripts + set endpoint"}
+          </Btn>
+          <p style={{ fontSize: 10, color: "#9ca3af", margin: 0 }}>
+            Browser → hosted APIs are blocked by CORS and would expose your key — point this at a local model (Ollama) or your own server proxy. The verdict is advisory; you still own the rating.
+          </p>
+
+          {err && <div style={{ padding: 8, background: "#fef2f0", border: "1px solid #f5d5d0", borderRadius: 6, fontSize: 11, color: "#c44" }}>{"⚠"} {err}</div>}
+
+          {res && (
+            <div style={{ fontSize: 12, color: "#4a5568", lineHeight: 1.6, marginTop: 4 }}>
+              <div style={{ marginBottom: 6 }}>
+                <strong>Verdict:</strong>{" "}
+                {res.bucket === null
+                  ? <Badge text="Abstain — human review" color="#8a6a10" bg="#fef8e8" />
+                  : <Badge text={`${res.bucket} — ${SCALE[res.bucket].label}`} color={SCALE[res.bucket].c} bg="#f4f5f7" />}
+                <span style={{ marginLeft: 8, fontSize: 11, color: "#9ca3af" }}>
+                  confidence {res.confidence} · agreement {res.agreement} · n={res.samples}
+                </span>
+              </div>
+              {res.perCriterion && (
+                <div style={{ marginBottom: 6, fontFamily: "var(--mono)", fontSize: 11 }}>
+                  {Object.entries(res.perCriterion).map(([k, v]) => (
+                    <span key={k} style={{ marginRight: 10 }}>{k}: <strong style={{ color: v > 0 ? "#1a7a3a" : v < 0 ? "#993333" : "#6b7280" }}>{v > 0 ? "+" : ""}{v}</strong></span>
+                  ))}
+                  <span style={{ color: "#9ca3af" }}>(+ = LEFT, − = RIGHT)</span>
+                </div>
+              )}
+              {res.rationale && <div style={{ marginBottom: 6 }}><strong>Rationale:</strong> {res.rationale}</div>}
+              {(res.weakLeft.length > 0 || res.weakRight.length > 0) && (
+                <div style={{ marginBottom: 6 }}>
+                  {res.weakLeft.map((w, i) => <div key={"l" + i} style={{ paddingLeft: 10, fontSize: 11 }}><code style={{ color: "#993333" }}>{w.code}</code> (LEFT) {w.justification}</div>)}
+                  {res.weakRight.map((w, i) => <div key={"r" + i} style={{ paddingLeft: 10, fontSize: 11 }}><code style={{ color: "#993333" }}>{w.code}</code> (RIGHT) {w.justification}</div>)}
+                </div>
+              )}
+              {res.cautions && res.cautions.map((c, i) => (
+                <div key={i} style={{ padding: 8, marginBottom: 4, background: "#fdf0f0", border: "1px solid #f5d5d0", borderRadius: 6, fontSize: 11, color: "#993333" }}>{"⚠"} {c}</div>
+              ))}
+            </div>
+          )}
+        </div>
       )}
     </Card>
   );
@@ -757,6 +863,7 @@ ${rationale}`;
         {step === 1 && (
           <>
             <SuggestionCard left={transcriptLeft} right={transcriptRight} />
+            <JudgePanel task={taskPrompt} left={transcriptLeft} right={transcriptRight} />
             <WorksheetView worksheet={worksheet} setScore={setScore} dimensions={dimensions} />
             <div style={{ display: "flex", gap: 8 }}>
               <Btn onClick={() => setStep(0)}>{"←"} Back</Btn>

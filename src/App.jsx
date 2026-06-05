@@ -462,11 +462,18 @@ function WorksheetView({ worksheet, setScore, dimensions }) {
   );
 
   return (
-    <Card tag="⚙" title="Comparison Worksheet — score each side 1–5">
-      <p style={{ fontSize: 11, color: "#6b7280", marginTop: 0, marginBottom: 12 }}>
-        Weighted dimensions help you reason structurally. This produces a <strong>suggestion only</strong>;
-        the official Overall Preference is a separate, manual choice on the next step.
-      </p>
+    <Card tag="⚙" title="Comparison Worksheet (optional helper)">
+      <div style={{ fontSize: 12, color: "#4a5568", marginTop: 0, marginBottom: 12, lineHeight: 1.6, background: "#f6f7f9", border: "1px solid #e8eaed", borderRadius: 8, padding: 10 }}>
+        <div style={{ marginBottom: 6 }}><Badge text="OPTIONAL — not submitted" color="#8a6a10" bg="#fef8e8" /></div>
+        <strong>What is this?</strong> A thinking aid. You give each side a 1–5 score on a few things
+        (Is it correct? Did it follow instructions? etc.). The tool multiplies by the weights and adds them
+        up to <em>suggest</em> a 0–7 preference.<br />
+        <strong>Why bother?</strong> It stops you from picking a winner on gut feel — it forces you to
+        compare the two sides on what actually matters (correctness first). The number it suggests is just
+        a sanity check.<br />
+        <strong>Do I have to?</strong> No. This is never sent anywhere. If you already know which side is
+        better, click <em>“Next: LEFT classifications”</em> and skip it. 1 = poor on that dimension, 5 = excellent.
+      </div>
 
       {dimensions.map(d => (
         <div key={d.key} style={{ padding: "8px 0", borderBottom: "1px solid #f5f5f5" }}>
@@ -719,20 +726,32 @@ ${rationale}`;
     flash("Saved to history — fresh eval started");
   };
 
-  /* ── Validation: blocking errors vs non-blocking warnings ── */
+  /* ── Validation: blocking errors vs non-blocking warnings ──
+     Every free-text field is listed explicitly with its CURRENT length and the
+     minimum, so "invalid character lengths" is never a mystery: each ✗ row names
+     the exact box, where to find it, and how many more characters it needs. */
+  const shortMsg = (where, label, len, min) =>
+    len === 0
+      ? `${where} → "${label}" is EMPTY (needs ${min}+ characters)`
+      : `${where} → "${label}" is too short: ${len}/${min} — add ${min - len} more character${min - len === 1 ? "" : "s"}`;
+
+  const freeTextFields = [
+    { where: "LEFT tab", label: "Strengths of Response", len: strengthLeft.length, min: MIN_STRENGTH_CHARS },
+    { where: "RIGHT tab", label: "Strengths of Response", len: strengthRight.length, min: MIN_STRENGTH_CHARS },
+    ...weakLeft.flatMap(w => [
+      { where: `LEFT tab · [${w.code}]`, label: "Justification", len: w.justification.length, min: MIN_ISSUE_JUSTIFY_CHARS },
+      { where: `LEFT tab · [${w.code}]`, label: "Transcript evidence", len: w.evidence.length, min: MIN_ISSUE_EVIDENCE_CHARS },
+    ]),
+    ...weakRight.flatMap(w => [
+      { where: `RIGHT tab · [${w.code}]`, label: "Justification", len: w.justification.length, min: MIN_ISSUE_JUSTIFY_CHARS },
+      { where: `RIGHT tab · [${w.code}]`, label: "Transcript evidence", len: w.evidence.length, min: MIN_ISSUE_EVIDENCE_CHARS },
+    ]),
+    { where: "Preference tab", label: "Rationale", len: rationale.length, min: MIN_RATIONALE_CHARS },
+  ];
+
   const errors = [];
-  if (strengthLeft.length < MIN_STRENGTH_CHARS) errors.push(`LEFT strengths: ${MIN_STRENGTH_CHARS - strengthLeft.length} chars short (min ${MIN_STRENGTH_CHARS})`);
-  if (strengthRight.length < MIN_STRENGTH_CHARS) errors.push(`RIGHT strengths: ${MIN_STRENGTH_CHARS - strengthRight.length} chars short (min ${MIN_STRENGTH_CHARS})`);
-  weakLeft.forEach(w => {
-    if (w.justification.length < MIN_ISSUE_JUSTIFY_CHARS) errors.push(`LEFT [${w.code}] justification < ${MIN_ISSUE_JUSTIFY_CHARS} chars`);
-    if (w.evidence.length < MIN_ISSUE_EVIDENCE_CHARS) errors.push(`LEFT [${w.code}] evidence < ${MIN_ISSUE_EVIDENCE_CHARS} chars`);
-  });
-  weakRight.forEach(w => {
-    if (w.justification.length < MIN_ISSUE_JUSTIFY_CHARS) errors.push(`RIGHT [${w.code}] justification < ${MIN_ISSUE_JUSTIFY_CHARS} chars`);
-    if (w.evidence.length < MIN_ISSUE_EVIDENCE_CHARS) errors.push(`RIGHT [${w.code}] evidence < ${MIN_ISSUE_EVIDENCE_CHARS} chars`);
-  });
-  if (pref === null) errors.push("No Overall Preference selected");
-  if (rationale.length < MIN_RATIONALE_CHARS) errors.push(`Rationale < ${MIN_RATIONALE_CHARS} chars`);
+  freeTextFields.forEach(f => { if (f.len < f.min) errors.push(shortMsg(f.where, f.label, f.len, f.min)); });
+  if (pref === null) errors.push("Preference tab → no Overall Preference (0–7) selected");
 
   const warnings = [];
   // (1) Worksheet vs preference
@@ -907,9 +926,17 @@ ${rationale}`;
         {step === 4 && (
           <>
             <Card tag={"⚖"} title="Overall Preference (0 = LEFT … 7 = RIGHT)">
-              <p style={{ fontSize: 11, color: "#6b7280", marginTop: 0, marginBottom: 10 }}>
-                0 is the strongest preference for the LEFT model. 7 is the strongest preference for the RIGHT model.
-              </p>
+              <div style={{ fontSize: 12, color: "#4a5568", marginTop: 0, marginBottom: 10, lineHeight: 1.6, background: "#f6f7f9", border: "1px solid #e8eaed", borderRadius: 8, padding: 10 }}>
+                <strong>What you're answering:</strong> "Which response is better, and by how much?" One number, 0–7.
+                There is no neutral middle — you must lean one way.<br />
+                <strong>Left half (0–3) = LEFT is better. Right half (4–7) = RIGHT is better.</strong> The further
+                from the middle, the bigger the gap:
+                <span style={{ display: "block", marginTop: 4, fontFamily: "var(--mono)", fontSize: 11 }}>
+                  0/7 = one side is clearly correct and the other is terrible &nbsp;·&nbsp; 3/4 = very close, could go either way
+                </span>
+                <strong>Rule of thumb:</strong> correct final code beats a tidy-but-wrong answer. Pick the number,
+                then make sure your rationale below argues for the same side.
+              </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                 {SCALE.map(s => (
                   <button key={s.val} onClick={() => setPref(s.val)} style={{
@@ -957,6 +984,27 @@ ${rationale}`;
                   <div key={i} style={{ padding: "7px 10px", borderRadius: 5, background: "#fef2f0", border: "1px solid #f5d5d0", fontSize: 12, color: "#c44", fontWeight: 500, marginBottom: 4 }}>{"✗"} {e}</div>
                 ))
               )}
+            </Card>
+
+            <Card tag={"🅰"} title="Free-text fields — character check">
+              <p style={{ fontSize: 11, color: "#6b7280", marginTop: 0, marginBottom: 8 }}>
+                If the form says <em>“Cannot submit — some free text classifications have invalid character lengths,”</em>
+                it means one of these boxes is below its minimum (or empty). Each ✗ below is the exact culprit — its
+                tab, which field, and how many characters to add.
+              </p>
+              <div style={{ fontSize: 12, fontFamily: "var(--mono)", lineHeight: 1.7 }}>
+                {freeTextFields.map((f, i) => {
+                  const ok = f.len >= f.min;
+                  return (
+                    <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "3px 0" }}>
+                      <span style={{ color: ok ? "#1a7a3a" : "#c44", fontWeight: 800, width: 14 }}>{ok ? "✓" : "✗"}</span>
+                      <span style={{ color: ok ? "#4a5568" : "#c44" }}>
+                        {f.where} → {f.label}: <strong>{f.len}/{f.min}</strong>{!ok && (f.len === 0 ? " (empty)" : ` — add ${f.min - f.len}`)}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
             </Card>
 
             {warnings.length > 0 && (

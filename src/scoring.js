@@ -146,7 +146,10 @@ export function parseTranscript(text) {
   const successLine = /(?:successfully|all tests pass|this (?:should|will) (?:fix|work|resolve)|fix(?:ed|es) the (?:issue|bug|problem)|changes are (?:complete|done)|solution is (?:complete|done)|looks (?:good|correct)|works as expected)/i;
   // Real runtime failures only — NOT grep/exploration misses ("No such file").
   const errorLine = /(?:Traceback|command not found|NameError|ImportError|SyntaxError|AttributeError|AssertionError|IndentationError|KeyError:)/;
-  const revertLine = /\b(?:wait,|actually,|re-?think|reconsider|let me revert|i'?ll revert|revert(?:ing)?|undo\b|oops|my mistake|on second thought|scratch that|that'?s wrong|wrong (?:direction|approach)|incorrect approach)\b/i;
+  // NB: keep whole-word anchors OFF the punctuation-ending alternatives — `\bwait,\b`
+  // never matches ("," is a non-word char, so the trailing \b fails). Anchor only the
+  // bare words; let the phrase alternatives match literally.
+  const revertLine = /\b(?:wait|actually|reconsider|undo|oops)\b|re-?think|let me revert|i'?ll revert|revert(?:ing)?|my mistake|on second thought|scratch that|that'?s wrong|wrong (?:direction|approach)|incorrect approach/i;
   const searchCmd = /\*\*(?:search_)?command:?\*\*\s*`([^`]+)`/i;
 
   // Whole-transcript evidence signals

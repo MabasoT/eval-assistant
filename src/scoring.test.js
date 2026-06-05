@@ -121,7 +121,8 @@ const LEFT_TX = `
 
 ### View \`/repo/databricks/koalas/frame.py\`
 
-Wait, the issue is supporting list, not rejecting it. Let me re-think.
+Wait, the issue is supporting list, not rejecting it.
+Let me re-think the approach here.
 
 ### Edit \`/repo/databricks/koalas/frame.py\`
 **Replace:**

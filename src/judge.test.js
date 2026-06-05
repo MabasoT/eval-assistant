@@ -17,7 +17,10 @@ import {
   leftScoreToBucket,
   aggregateJudgments,
   runJudge,
+  parseDraftResponse,
+  runDraft,
 } from "./judge.js";
+import { DEFAULT_DIMENSIONS, DEFAULT_TAXONOMY } from "./scoring.js";
 
 /* A correct vs subtly-broken pair. The CORRECT side carries a token the mock
    "competent judge" can recognize — standing in for real semantic judgment. */
@@ -158,4 +161,64 @@ test("runJudge: drops unparseable samples and still returns a verdict", async ()
 
 test("runJudge throws a clear error when no model adapter is supplied", async () => {
   await assert.rejects(() => runJudge({ task: "x", leftText: "a", rightText: "b" }), /model adapter/i);
+});
+
+/* ───── full-form auto-draft ───── */
+test("parseDraftResponse validates codes, clamps scores, keeps every dimension", () => {
+  const raw = JSON.stringify({
+    strengthA: "a", strengthB: "b",
+    weaknessesA: [{ code: "ROOT", justification: "x", evidence: "y" }, { code: "NOPE", justification: "bad code" }],
+    weaknessesB: [],
+    worksheet: { correctness: { a: 9, b: -2 } }, // out of range + missing dims
+    rationale: "r",
+  });
+  const d = parseDraftResponse(raw, { dimensions: DEFAULT_DIMENSIONS, taxonomy: DEFAULT_TAXONOMY });
+  assert.equal(d.weakA.length, 1, "invalid taxonomy code dropped");
+  assert.equal(d.weakA[0].code, "ROOT");
+  assert.equal(d.wsAB.correctness.a, 5);   // clamped 9 -> 5
+  assert.equal(d.wsAB.correctness.b, 1);   // clamped -2 -> 1
+  // every dimension present, missing ones default to neutral 3
+  for (const dim of DEFAULT_DIMENSIONS) assert.ok(d.wsAB[dim.key], `dim ${dim.key} present`);
+  assert.equal(d.wsAB[DEFAULT_DIMENSIONS[1].key].a, 3);
+});
+
+/** A mock that scores whichever side carries CORRECT_FIX high and fills the form. */
+const draftMock = async (messages) => {
+  const user = messages.find(m => m.role === "user").content;
+  const aSection = user.split("=== RESPONSE A ===")[1].split("=== RESPONSE B ===")[0];
+  const aGood = /CORRECT_FIX/.test(aSection);
+  const hi = aGood ? 5 : 2, lo = aGood ? 2 : 5;
+  const worksheet = {};
+  for (const d of DEFAULT_DIMENSIONS) worksheet[d.key] = { a: hi, b: lo };
+  return JSON.stringify({
+    strengthA: "A".repeat(210), strengthB: "B".repeat(210),
+    weaknessesA: aGood ? [] : [{ code: "ROOT", justification: "x".repeat(25), evidence: "y".repeat(25) }],
+    weaknessesB: aGood ? [{ code: "ROOT", justification: "x".repeat(25), evidence: "y".repeat(25) }] : [],
+    worksheet, rationale: "r".repeat(60),
+  });
+};
+
+test("runDraft fills the whole form and DERIVES the preference from the worksheet", async () => {
+  const r = await runDraft({
+    task: "dedupe", leftText: CORRECT, rightText: BROKEN, model: draftMock,
+    dimensions: DEFAULT_DIMENSIONS, taxonomy: DEFAULT_TAXONOMY,
+  });
+  // LEFT carries CORRECT_FIX -> worksheet favors LEFT -> preference in the LEFT half.
+  assert.ok(r.preference !== null && r.preference <= 3, `expected LEFT preference, got ${r.preference}`);
+  assert.ok(r.strengthLeft.length >= 200 && r.strengthRight.length >= 200);
+  assert.equal(r.weakLeft.length, 0);
+  assert.ok(r.weakRight.some(w => w.code === "ROOT"));
+  // worksheet is complete (every dimension scored for both sides)
+  for (const dim of DEFAULT_DIMENSIONS) {
+    assert.ok(r.worksheet[dim.key].L >= 1 && r.worksheet[dim.key].R >= 1);
+  }
+});
+
+test("runDraft is orientation-consistent (swap inputs -> RIGHT preference)", async () => {
+  const r = await runDraft({
+    task: "dedupe", leftText: BROKEN, rightText: CORRECT, model: draftMock,
+    dimensions: DEFAULT_DIMENSIONS, taxonomy: DEFAULT_TAXONOMY,
+  });
+  assert.ok(r.preference !== null && r.preference >= 4, `expected RIGHT preference, got ${r.preference}`);
+  assert.ok(r.weakLeft.some(w => w.code === "ROOT")); // broken is now LEFT
 });

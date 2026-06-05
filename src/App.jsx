@@ -12,7 +12,7 @@ import {
   parseTranscript,
   analyzePair,
 } from "./scoring.js";
-import { runJudge, openAiCompatibleAdapter } from "./judge.js";
+import { runJudge, runDraft, openAiCompatibleAdapter } from "./judge.js";
 
 /* ════════════════════════════════════════════════════════════════════════
    EVAL ASSISTANT — LEFT vs RIGHT response evaluation workbench
@@ -230,40 +230,48 @@ function SuggestionCard({ left, right }) {
    + self-consistency engine in judge.js against ANY OpenAI-compatible endpoint
    (Ollama at localhost works from the browser; hosted models need your own proxy
    because of CORS / key safety). Your key is held in memory only — never stored. */
-function JudgePanel({ task, left, right, evidence }) {
+function JudgePanel({ task, left, right, evidence, dimensions, taxonomy, onApply }) {
   const [open, setOpen] = useState(false);
-  const [endpoint, setEndpoint] = usePersist("eval-judge-endpoint", "http://localhost:11434/v1/chat/completions");
-  const [model, setModel] = usePersist("eval-judge-model", "qwen2.5-coder:7b");
-  const [apiKey, setApiKey] = useState(""); // in-memory only, never persisted
+  const [endpoint, setEndpoint] = usePersist("eval-judge-endpoint", "https://openrouter.ai/api/v1/chat/completions");
+  const [model, setModel] = usePersist("eval-judge-model", "anthropic/claude-3.5-sonnet");
+  const [apiKey, setApiKey] = usePersist("eval-judge-key", ""); // persisted for convenience — see warning + Clear
   const [samples, setSamples] = useState(1);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
-  const [res, setRes] = useState(null);
+  const [res, setRes] = useState(null);      // correctness verdict (runJudge)
+  const [draft, setDraft] = useState(null);  // full-form draft (runDraft)
 
   const ready = left.trim() && right.trim() && endpoint.trim() && model.trim();
+  const adapter = () => openAiCompatibleAdapter({ endpoint, apiKey: apiKey || undefined, model });
 
-  const run = async () => {
-    setBusy(true); setErr(null); setRes(null);
+  const runAutoDraft = async () => {
+    setBusy("draft"); setErr(null); setDraft(null); setRes(null);
     try {
-      const adapter = openAiCompatibleAdapter({ endpoint, apiKey: apiKey || undefined, model });
-      const r = await runJudge({ task, leftText: left, rightText: right, evidence, model: adapter, samples, swapPositions: true });
+      const d = await runDraft({ task, leftText: left, rightText: right, model: adapter(), dimensions, taxonomy, samples, swapPositions: true });
+      if (!d) setErr("The model returned nothing usable. Try another model or check the key/endpoint.");
+      else setDraft(d);
+    } catch (e) { setErr(String((e && e.message) || e)); }
+    finally { setBusy(false); }
+  };
+
+  const runVerdict = async () => {
+    setBusy("judge"); setErr(null); setRes(null); setDraft(null);
+    try {
+      const r = await runJudge({ task, leftText: left, rightText: right, evidence, model: adapter(), samples, swapPositions: true });
       setRes(r);
-    } catch (e) {
-      setErr(String((e && e.message) || e));
-    } finally {
-      setBusy(false);
-    }
+    } catch (e) { setErr(String((e && e.message) || e)); }
+    finally { setBusy(false); }
   };
 
   const inp = { padding: "5px 8px", borderRadius: 6, border: "1px solid #e8eaed", fontSize: 11, fontFamily: "var(--mono)", background: "#fafbfc", boxSizing: "border-box" };
 
   return (
-    <Card tag="AI JUDGE" title="LLM-as-judge (correctness, debiased)" right={
+    <Card tag="AI ASSIST" title="AI auto-draft + judge (your model)" right={
       <Btn small onClick={() => setOpen(o => !o)}>{open ? "Hide" : "Set up"}</Btn>
     }>
       {!open ? (
         <p style={{ fontSize: 11.5, color: "#6b7280", margin: 0 }}>
-          The only layer that can catch a subtly broken algorithm — it asks a real model to read both diffs. Runs each comparison in BOTH orderings (cancels position bias) and can sample N times (self-consistency). Abstains when the model is unsure. Bring your own endpoint; your key stays in memory.
+          Let a real model <strong>fill the whole form for you</strong> — strengths, weaknesses, the 1–5 worksheet, and a suggested 0–7 preference — then you review and approve. Or run just the debiased correctness verdict. Bring your own model (OpenRouter works from the browser).
         </p>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -271,26 +279,65 @@ function JudgePanel({ task, left, right, evidence }) {
             <label style={{ fontSize: 10, color: "#6b7280" }}>Endpoint (OpenAI-compatible)
               <input value={endpoint} onChange={e => setEndpoint(e.target.value)} style={{ ...inp, width: "100%" }} />
             </label>
-            <label style={{ fontSize: 10, color: "#6b7280" }}>Model
+            <label style={{ fontSize: 10, color: "#6b7280" }}>Model (e.g. anthropic/claude-3.5-sonnet, openai/gpt-4o-mini)
               <input value={model} onChange={e => setModel(e.target.value)} style={{ ...inp, width: "100%" }} />
             </label>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 6 }}>
-            <label style={{ fontSize: 10, color: "#6b7280" }}>API key (optional; in-memory only — not for shared machines)
-              <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="leave blank for local Ollama" style={{ ...inp, width: "100%" }} />
+          <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr auto", gap: 6, alignItems: "end" }}>
+            <label style={{ fontSize: 10, color: "#6b7280" }}>API key (OpenRouter sk-or-…)
+              <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="paste your key" style={{ ...inp, width: "100%" }} />
             </label>
-            <label style={{ fontSize: 10, color: "#6b7280" }}>Samples (self-consistency)
+            <label style={{ fontSize: 10, color: "#6b7280" }}>Samples
               <input type="number" min={1} max={5} value={samples} onChange={e => setSamples(Math.max(1, Math.min(5, Number(e.target.value) || 1)))} style={{ ...inp, width: "100%" }} />
             </label>
+            <Btn small onClick={() => setApiKey("")}>Clear key</Btn>
           </div>
-          <Btn primary disabled={!ready || busy} onClick={run}>
-            {busy ? "Judging (2 orderings × samples)…" : ready ? "Run AI Judge" : "Paste transcripts + set endpoint"}
-          </Btn>
+          <div style={{ padding: 7, background: "#fef8e8", border: "1px solid #f0e0a8", borderRadius: 6, fontSize: 10, color: "#8a6a10" }}>
+            {"⚠"} The key is stored in this browser (localStorage) for convenience. Don't use this on a shared computer, and rotate the key if it has ever been pasted somewhere public. Use "Clear key" when done.
+          </div>
+
+          <div style={{ display: "flex", gap: 6 }}>
+            <Btn primary disabled={!ready || busy} onClick={runAutoDraft} style={{ flex: 2 }}>
+              {busy === "draft" ? "Drafting…" : ready ? "✨ Auto-draft the whole form" : "Paste transcripts + set key"}
+            </Btn>
+            <Btn disabled={!ready || busy} onClick={runVerdict} style={{ flex: 1 }}>
+              {busy === "judge" ? "Judging…" : "Verdict only"}
+            </Btn>
+          </div>
           <p style={{ fontSize: 10, color: "#9ca3af", margin: 0 }}>
-            Browser → hosted APIs are blocked by CORS and would expose your key — point this at a local model (Ollama) or your own server proxy. The verdict is advisory; you still own the rating.
+            Both run the comparison in BOTH orderings to cancel position bias. The draft never auto-submits — you click <strong>Apply</strong>, then review every tab.
           </p>
 
           {err && <div style={{ padding: 8, background: "#fef2f0", border: "1px solid #f5d5d0", borderRadius: 6, fontSize: 11, color: "#c44" }}>{"⚠"} {err}</div>}
+
+          {draft && (
+            <div style={{ fontSize: 12, color: "#4a5568", lineHeight: 1.6, marginTop: 4, padding: 10, background: "#f6f7f9", border: "1px solid #e8eaed", borderRadius: 8 }}>
+              <div style={{ marginBottom: 6 }}>
+                <strong>Suggested preference:</strong>{" "}
+                {draft.preference === null
+                  ? <Badge text="Tie — pick 3 or 4" color="#8a6a10" bg="#fef8e8" />
+                  : <Badge text={`${draft.preference} — ${SCALE[draft.preference].label}`} color={SCALE[draft.preference].c} bg="#fff" />}
+                <span style={{ marginLeft: 8, fontSize: 11, color: "#9ca3af" }}>worksheet LEFT {draft.leftTotal} vs RIGHT {draft.rightTotal} · n={draft.samples}</span>
+              </div>
+              <div style={{ fontFamily: "var(--mono)", fontSize: 10.5, marginBottom: 6 }}>
+                {dimensions.map(dm => (
+                  <span key={dm.key} style={{ marginRight: 10 }}>{dm.label}: <strong style={{ color: "#1a8a45" }}>{draft.worksheet[dm.key]?.L}</strong>/<strong style={{ color: "#993333" }}>{draft.worksheet[dm.key]?.R}</strong></span>
+                ))}
+              </div>
+              <div style={{ marginBottom: 4 }}><strong>LEFT strengths:</strong> {draft.strengthLeft.slice(0, 140)}… <span style={{ color: "#9ca3af" }}>({draft.strengthLeft.length} chars)</span></div>
+              <div style={{ marginBottom: 4 }}><strong>RIGHT strengths:</strong> {draft.strengthRight.slice(0, 140)}… <span style={{ color: "#9ca3af" }}>({draft.strengthRight.length} chars)</span></div>
+              {draft.weakLeft.map((w, i) => <div key={"l" + i} style={{ fontSize: 11 }}><code style={{ color: "#993333" }}>{w.code}</code> (LEFT) {w.justification}</div>)}
+              {draft.weakRight.map((w, i) => <div key={"r" + i} style={{ fontSize: 11 }}><code style={{ color: "#993333" }}>{w.code}</code> (RIGHT) {w.justification}</div>)}
+              {draft.rationale && <div style={{ marginTop: 4 }}><strong>Rationale:</strong> {draft.rationale}</div>}
+              <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                <Btn primary onClick={() => onApply(draft)} style={{ flex: 1 }}>Apply to form → review & validate</Btn>
+                <Btn onClick={() => setDraft(null)}>Discard</Btn>
+              </div>
+              <p style={{ fontSize: 10, color: "#9ca3af", margin: "6px 0 0" }}>
+                After applying, walk LEFT → RIGHT → Preference → Submit. Edit anything you disagree with; the Submit step will confirm character minimums.
+              </p>
+            </div>
+          )}
 
           {res && (
             <div style={{ fontSize: 12, color: "#4a5568", lineHeight: 1.6, marginTop: 4 }}>
@@ -303,21 +350,7 @@ function JudgePanel({ task, left, right, evidence }) {
                   confidence {res.confidence} · agreement {res.agreement} · n={res.samples}
                 </span>
               </div>
-              {res.perCriterion && (
-                <div style={{ marginBottom: 6, fontFamily: "var(--mono)", fontSize: 11 }}>
-                  {Object.entries(res.perCriterion).map(([k, v]) => (
-                    <span key={k} style={{ marginRight: 10 }}>{k}: <strong style={{ color: v > 0 ? "#1a7a3a" : v < 0 ? "#993333" : "#6b7280" }}>{v > 0 ? "+" : ""}{v}</strong></span>
-                  ))}
-                  <span style={{ color: "#9ca3af" }}>(+ = LEFT, − = RIGHT)</span>
-                </div>
-              )}
               {res.rationale && <div style={{ marginBottom: 6 }}><strong>Rationale:</strong> {res.rationale}</div>}
-              {(res.weakLeft.length > 0 || res.weakRight.length > 0) && (
-                <div style={{ marginBottom: 6 }}>
-                  {res.weakLeft.map((w, i) => <div key={"l" + i} style={{ paddingLeft: 10, fontSize: 11 }}><code style={{ color: "#993333" }}>{w.code}</code> (LEFT) {w.justification}</div>)}
-                  {res.weakRight.map((w, i) => <div key={"r" + i} style={{ paddingLeft: 10, fontSize: 11 }}><code style={{ color: "#993333" }}>{w.code}</code> (RIGHT) {w.justification}</div>)}
-                </div>
-              )}
               {res.cautions && res.cautions.map((c, i) => (
                 <div key={i} style={{ padding: 8, marginBottom: 4, background: "#fdf0f0", border: "1px solid #f5d5d0", borderRadius: 6, fontSize: 11, color: "#993333" }}>{"⚠"} {c}</div>
               ))}
@@ -726,6 +759,20 @@ ${rationale}`;
     flash("Saved to history — fresh eval started");
   };
 
+  /* ── Apply an AI auto-draft into the form (user reviews, then validates) ── */
+  const applyDraft = (d) => {
+    if (!d) return;
+    if (typeof d.strengthLeft === "string") setStrengthLeft(d.strengthLeft);
+    if (typeof d.strengthRight === "string") setStrengthRight(d.strengthRight);
+    if (Array.isArray(d.weakLeft)) setWeakLeft(d.weakLeft);
+    if (Array.isArray(d.weakRight)) setWeakRight(d.weakRight);
+    if (d.worksheet) setWorksheet(d.worksheet);
+    if (d.preference !== undefined) setPref(d.preference);
+    if (typeof d.rationale === "string") setRationale(d.rationale);
+    setStep(2); // jump to LEFT classifications so you can review top-to-bottom
+    flash("AI draft applied — review LEFT → RIGHT → Preference, then Submit");
+  };
+
   /* ── Validation: blocking errors vs non-blocking warnings ──
      Every free-text field is listed explicitly with its CURRENT length and the
      minimum, so "invalid character lengths" is never a mystery: each ✗ row names
@@ -882,7 +929,8 @@ ${rationale}`;
         {step === 1 && (
           <>
             <SuggestionCard left={transcriptLeft} right={transcriptRight} />
-            <JudgePanel task={taskPrompt} left={transcriptLeft} right={transcriptRight} />
+            <JudgePanel task={taskPrompt} left={transcriptLeft} right={transcriptRight}
+              dimensions={dimensions} taxonomy={taxonomy} onApply={applyDraft} />
             <WorksheetView worksheet={worksheet} setScore={setScore} dimensions={dimensions} />
             <div style={{ display: "flex", gap: 8 }}>
               <Btn onClick={() => setStep(0)}>{"←"} Back</Btn>

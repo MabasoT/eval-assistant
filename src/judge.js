@@ -23,7 +23,7 @@
    position-swapping is just an averaging step.
    ════════════════════════════════════════════════════════════════════════ */
 
-import { SCALE } from "./scoring.js";
+import { SCALE, suggestBucket, weightedTotal } from "./scoring.js";
 
 /* ───── The evaluation policy the judge must follow ─────
    This distills a rigorous human/AI evaluation process into a reusable rubric.
@@ -295,6 +295,135 @@ export async function runJudge({
 }
 
 /* ════════════════════════════════════════════════════════════════════════
+   FULL-FORM AUTO-DRAFT — fills the entire evaluation, ready to approve
+   ────────────────────────────────────────────────────────────────────────
+   runDraft() asks the model to produce every field of the form (strengths,
+   weaknesses with justification + evidence, and a 1–5 score per worksheet
+   dimension for each side). The Overall Preference is then DERIVED from the
+   worksheet via suggestBucket() — so the suggested rating can never disagree
+   with the worksheet, and the number is less position-sensitive than asking the
+   model for a holistic A-vs-B score. You review the draft and click to apply.
+   ════════════════════════════════════════════════════════════════════════ */
+
+export function buildDraftPrompt({ task, responseA, responseB, dimensions, taxonomy }) {
+  const taxList = (taxonomy || []).map(t => `${t.code}: ${t.desc}`).join("\n");
+  const wsSchema = (dimensions || []).map(d => `"${d.key}": {"a": <1-5>, "b": <1-5>}`).join(", ");
+  const wsLegend = (dimensions || []).map(d => `${d.key} = ${d.label} (${d.desc})`).join("; ");
+  const system = `You are a rigorous, impartial code-evaluation judge. Read BOTH responses and draft a COMPLETE evaluation form.
+Judge CORRECTNESS of the FINAL code first — hunt subtle bugs (off-by-one, wrong index/alignment, races, edge cases, error-swallowing). A confident, well-tested WRONG fix is still wrong. Judge the final code, not the journey. Cite specific evidence. Apply the same scrutiny to both sides.
+
+Worksheet dimensions to score 1 (poor) … 5 (excellent), per side: ${wsLegend}
+
+Taxonomy codes (use ONLY these for weaknesses):
+${taxList}
+
+Output ONLY one JSON object, no markdown, no prose:
+{
+  "strengthA": "<at least 200 characters; specific files/tool calls/code/why it is correct>",
+  "strengthB": "<at least 200 characters>",
+  "weaknessesA": [{"code": "<one taxonomy code>", "justification": "<>=20 chars, why it is wrong and why it matters>", "evidence": "<exact quote or line ref from the transcript, >=20 chars>"}],
+  "weaknessesB": [ ... same shape ... ],
+  "worksheet": { ${wsSchema} },
+  "rationale": "<one paragraph, >=50 chars, naming the decisive difference; must agree with whichever side your worksheet scores higher>"
+}
+Only list weaknesses you can back with evidence; if a side has none use []. Fill EVERY worksheet dimension for both a and b.`;
+  const user = `TASK / ISSUE:\n${task || "(infer from the transcripts)"}\n\n=== RESPONSE A ===\n${responseA}\n\n=== RESPONSE B ===\n${responseB}\n\nDraft the full evaluation JSON now.`;
+  return { system, user };
+}
+
+const clampScore = x => { const n = Math.round(Number(x)); return Number.isFinite(n) ? Math.max(1, Math.min(5, n)) : 3; };
+
+export function parseDraftResponse(text, { dimensions, taxonomy }) {
+  const obj = extractJson(text);
+  if (!obj) return null;
+  const codes = new Set((taxonomy || []).map(t => t.code));
+  const cleanWeak = arr => (Array.isArray(arr) ? arr : [])
+    .filter(w => w && codes.has(w.code))
+    .map(w => ({ code: w.code, justification: String(w.justification || ""), evidence: String(w.evidence || "") }));
+  const wsAB = {};
+  for (const dim of (dimensions || [])) {
+    const cell = (obj.worksheet && obj.worksheet[dim.key]) || {};
+    wsAB[dim.key] = {
+      a: clampScore(cell.a ?? cell.left ?? cell.A ?? cell.L),
+      b: clampScore(cell.b ?? cell.right ?? cell.B ?? cell.R),
+    };
+  }
+  return {
+    strengthA: String(obj.strengthA || ""),
+    strengthB: String(obj.strengthB || ""),
+    weakA: cleanWeak(obj.weaknessesA),
+    weakB: cleanWeak(obj.weaknessesB),
+    wsAB,
+    rationale: String(obj.rationale || ""),
+  };
+}
+
+function averageWorksheets(list, dimensions) {
+  const out = {};
+  const avg = a => (a.length ? Math.max(1, Math.min(5, Math.round(a.reduce((x, y) => x + y, 0) / a.length))) : 3);
+  for (const dim of dimensions) {
+    const Ls = list.map(w => w[dim.key]?.L).filter(v => typeof v === "number");
+    const Rs = list.map(w => w[dim.key]?.R).filter(v => typeof v === "number");
+    out[dim.key] = { L: avg(Ls), R: avg(Rs) };
+  }
+  return out;
+}
+
+export async function runDraft({ task, leftText, rightText, model, dimensions, taxonomy, samples = 1, swapPositions = true }) {
+  if (typeof model !== "function") throw new Error("runDraft requires a model adapter: (messages) => Promise<string>");
+  const orderings = swapPositions ? ["LR", "RL"] : ["LR"];
+  const collected = [];
+  for (const ordering of orderings) {
+    const A = ordering === "LR" ? leftText : rightText;
+    const B = ordering === "LR" ? rightText : leftText;
+    const { system, user } = buildDraftPrompt({ task, responseA: A, responseB: B, dimensions, taxonomy });
+    const messages = [{ role: "system", content: system }, { role: "user", content: user }];
+    for (let s = 0; s < samples; s++) {
+      try {
+        const text = await model(messages);
+        const d = parseDraftResponse(text, { dimensions, taxonomy });
+        if (d) collected.push({ ordering, d });
+      } catch { /* skip this sample */ }
+    }
+  }
+  if (collected.length === 0) return null;
+
+  // Frame every worksheet to LEFT/RIGHT, then average (debiases the numbers).
+  const framedWs = collected.map(({ ordering, d }) => {
+    const ws = {};
+    for (const dim of dimensions) {
+      const cell = d.wsAB[dim.key] || { a: 3, b: 3 };
+      ws[dim.key] = ordering === "LR" ? { L: cell.a, R: cell.b } : { L: cell.b, R: cell.a };
+    }
+    return ws;
+  });
+  const worksheet = averageWorksheets(framedWs, dimensions);
+
+  // Text fields from an LR draft (A=LEFT) so the wording is correctly framed.
+  const lr = collected.find(x => x.ordering === "LR") || collected[0];
+  const isLR = lr.ordering === "LR";
+  const d = lr.d;
+  const strengthLeft = isLR ? d.strengthA : d.strengthB;
+  const strengthRight = isLR ? d.strengthB : d.strengthA;
+  const weakLeft = isLR ? d.weakA : d.weakB;
+  const weakRight = isLR ? d.weakB : d.weakA;
+
+  const leftTotal = weightedTotal(worksheet, "L", dimensions);
+  const rightTotal = weightedTotal(worksheet, "R", dimensions);
+  const { bucket } = suggestBucket(leftTotal, rightTotal);
+
+  return {
+    strengthLeft, strengthRight, weakLeft, weakRight,
+    worksheet,
+    preference: bucket,                          // derived from the worksheet
+    preferenceLabel: bucket === null ? "Tie — pick 3 or 4 manually" : SCALE[bucket].label,
+    rationale: d.rationale,
+    leftTotal, rightTotal,
+    samples: collected.length,
+  };
+}
+
+/* ════════════════════════════════════════════════════════════════════════
    Provider adapters (thin, optional, NOT unit-tested — they touch the network)
    ────────────────────────────────────────────────────────────────────────
    An adapter is just `(messages) => Promise<string>`. Keys/endpoints are
@@ -303,16 +432,23 @@ export async function runJudge({
 
 /** OpenAI-compatible chat endpoint (works with OpenAI, Ollama, vLLM, LM Studio,
     most proxies). For Ollama use endpoint "http://localhost:11434/v1/chat/completions". */
-export function openAiCompatibleAdapter({ endpoint, apiKey, model, temperature = 0.2, fetchImpl }) {
+export function openAiCompatibleAdapter({ endpoint, apiKey, model, temperature = 0.2, fetchImpl, extraHeaders }) {
   const f = fetchImpl || (typeof fetch !== "undefined" ? fetch : null);
   if (!f) throw new Error("No fetch implementation available");
   return async (messages) => {
+    // NB: we deliberately do NOT send `response_format` — many providers (incl.
+    // Anthropic models via OpenRouter) reject it. The prompt forces JSON and
+    // extractJson() tolerates fences/prose, so this is the most compatible path.
     const res = await f(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
-      body: JSON.stringify({ model, messages, temperature, response_format: { type: "json_object" } }),
+      headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}), ...(extraHeaders || {}) },
+      body: JSON.stringify({ model, messages, temperature }),
     });
-    if (!res.ok) throw new Error(`Model HTTP ${res.status}`);
+    if (!res.ok) {
+      let detail = "";
+      try { detail = (await res.text()).slice(0, 200); } catch { /* ignore */ }
+      throw new Error(`Model HTTP ${res.status}${detail ? ` — ${detail}` : ""}`);
+    }
     const data = await res.json();
     return data?.choices?.[0]?.message?.content ?? "";
   };

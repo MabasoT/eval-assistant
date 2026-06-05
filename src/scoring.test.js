@@ -23,6 +23,8 @@ import {
   evidenceSignals,
   evidenceBucket,
   analyzePair,
+  GENERIC_DETECTORS,
+  PANDAS_DETECTORS,
 } from "./scoring.js";
 
 /* A small fixed dimension set we control, so tests don't depend on the
@@ -204,8 +206,13 @@ test("evidenceBucket maps a strong RIGHT advantage to the RIGHT 'preferred' band
   assert.equal(evidenceBucket(0).bucket, null);  // too close to call
 });
 
-test("analyzePair suggests RIGHT preferred (bucket 6) on the Koalas task", () => {
-  const a = analyzePair(LEFT_TX, RIGHT_TX);
+/* With the pandas correctness pack opted in, the engine reproduces the hand
+   evaluation: RIGHT preferred (bucket 6). Domain knowledge is DATA you pass in,
+   not a baked-in branch — that is the whole point of the detector framework. */
+const PANDAS_PACK = { detectors: [...GENERIC_DETECTORS, ...PANDAS_DETECTORS] };
+
+test("analyzePair (pandas pack) suggests RIGHT preferred (bucket 6) on the Koalas task", () => {
+  const a = analyzePair(LEFT_TX, RIGHT_TX, PANDAS_PACK);
   assert.equal(a.bucket, 6, `expected bucket 6, got ${a.bucket} (score ${a.score})`);
   // RIGHT's safeguards should surface as LEFT weaknesses…
   const leftCodes = a.weakLeft.map(w => w.code);
@@ -216,7 +223,95 @@ test("analyzePair suggests RIGHT preferred (bucket 6) on the Koalas task", () =>
 });
 
 test("analyzePair is orientation-consistent (swapping sides mirrors the bucket)", () => {
-  const ab = analyzePair(LEFT_TX, RIGHT_TX).bucket;   // 6 (RIGHT better)
-  const ba = analyzePair(RIGHT_TX, LEFT_TX).bucket;   // 1 (LEFT better)
+  const ab = analyzePair(LEFT_TX, RIGHT_TX, PANDAS_PACK).bucket;
+  const ba = analyzePair(RIGHT_TX, LEFT_TX, PANDAS_PACK).bucket;
   assert.equal(ab + ba, 7, "mirrored buckets should sum to 7");
+});
+
+/* ════════════════════════════════════════════════════════════════════════
+   HARD / ADVERSARIAL example (different domain: a JS debounce race bug).
+   Here the SURFACE signals are a trap: the WRONG answer (RIGHT) is flashy —
+   edits 3 files, runs tests, claims success — while the CORRECT answer (LEFT)
+   is a tiny surgical fix (clear the stale timer) with no fanfare and no tests.
+   A naive "more thoroughness = better" engine would pick RIGHT. The point of
+   the calibration is that the generic engine must NOT confidently do so.
+   ════════════════════════════════════════════════════════════════════════ */
+const HARD_LEFT = `
+### Tool: bash_exploration_tool
+**search_command:** \`grep -n "setTimeout" /src/debounce.js\`
+
+### View \`/src/debounce.js\`
+The handle from the previous call is never cleared, so stale callbacks still fire.
+
+### Edit \`/src/debounce.js\`
+**With:**
+\`\`\`js
+function debounce(fn, ms) {
+  let prev;
+  return (...args) => {
+    clearTimeout(prev);
+    prev = setTimeout(() => fn(...args), ms);
+  };
+}
+\`\`\`
+This clears the stale timer before scheduling a new one.
+`;
+
+const HARD_RIGHT = `
+### Tool: bash_exploration_tool
+**search_command:** \`grep -rn "debounce" /src\`
+
+### View \`/src/debounce.js\`
+### View \`/src/handlers.js\`
+
+### Edit \`/src/debounce.js\`
+**With:**
+\`\`\`js
+function debounce(fn, ms) {
+  return (...args) => {
+    setTimeout(() => {
+      try { fn(...args); } catch (e) { /* swallow */ }
+    }, ms);
+  };
+}
+\`\`\`
+
+### Edit \`/src/handlers.js\`
+### Edit \`/src/index.js\`
+Let me run the tests.
+All tests pass. This fixes the bug successfully.
+`;
+
+test("HARD: generic engine refuses to over-rank a flashy-but-unverified answer", () => {
+  const a = analyzePair(HARD_LEFT, HARD_RIGHT); // GENERIC detectors only
+  // The raw structure DOES lean toward the thorough (wrong) RIGHT side…
+  assert.ok(a.score > 0, "thoroughness pushes the raw score toward RIGHT");
+  // …but the engine caps it at a MARGINAL lean (4), never "preferred/strong" (5-7)…
+  assert.equal(a.bucket, 4, `expected marginal RIGHT (4), got ${a.bucket}`);
+  assert.equal(a.confidence, "low");
+  // …and it must loudly warn that thoroughness is not correctness.
+  assert.ok(a.cautions.length >= 1, "should emit at least one caution");
+  assert.ok(
+    a.cautions.some(c => /correctness|thoroughness|verify/i.test(c)),
+    "a caution should call out thoroughness-vs-correctness"
+  );
+});
+
+test("HARD: adding ONE correctness detector flips the verdict to the correct side", () => {
+  // The kind of signal a deeper analyzer (or an LLM judge) would supply:
+  // does the fix address the ROOT CAUSE (clearing the stale timer)?
+  const clearsStaleTimer = {
+    id: "clearsStaleTimer",
+    label: "Clears stale timer (root cause)",
+    tier: "correctness",
+    polarity: "good",
+    weight: 1.3,
+    test: (_p, raw) => /clearTimeout|clears the stale timer/i.test(raw),
+  };
+  const a = analyzePair(HARD_LEFT, HARD_RIGHT, {
+    detectors: [...GENERIC_DETECTORS, clearsStaleTimer],
+  });
+  assert.ok(a.score < 0, "correctness evidence pulls the score toward LEFT");
+  assert.ok(a.bucket !== null && a.bucket <= 3, `expected a LEFT bucket (0-3), got ${a.bucket}`);
+  assert.notEqual(a.confidence, "low", "a real correctness signal should raise confidence");
 });

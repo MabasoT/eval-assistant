@@ -203,8 +203,15 @@ function SuggestionCard({ left, right }) {
           {(a.weakLeft.length > 0 || a.weakRight.length > 0) && (
             <div style={{ marginBottom: 8 }}>
               <strong>Draft issues to verify:</strong>
-              {a.weakLeft.map((w, i) => <div key={"l" + i} style={{ paddingLeft: 10, fontSize: 11 }}><code style={{ color: "#993333" }}>{w.code}</code> {w.justification}</div>)}
-              {a.weakRight.map((w, i) => <div key={"r" + i} style={{ paddingLeft: 10, fontSize: 11 }}><code style={{ color: "#993333" }}>{w.code}</code> {w.justification}</div>)}
+              {a.weakLeft.map((w, i) => <div key={"l" + i} style={{ paddingLeft: 10, fontSize: 11 }}><code style={{ color: "#993333" }}>{w.code}</code> (LEFT) {w.justification}</div>)}
+              {a.weakRight.map((w, i) => <div key={"r" + i} style={{ paddingLeft: 10, fontSize: 11 }}><code style={{ color: "#993333" }}>{w.code}</code> (RIGHT) {w.justification}</div>)}
+            </div>
+          )}
+          {a.cautions && a.cautions.length > 0 && (
+            <div style={{ marginBottom: 8 }}>
+              {a.cautions.map((c, i) => (
+                <div key={i} style={{ padding: 8, marginBottom: 4, background: "#fdf0f0", border: "1px solid #f5d5d0", borderRadius: 6, fontSize: 11, color: "#993333" }}>{"⚠"} {c}</div>
+              ))}
             </div>
           )}
           <div style={{ padding: 8, background: "#fef8e8", borderRadius: 6, fontSize: 11 }}>{"💡"} {a.note}</div>

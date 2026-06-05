@@ -229,68 +229,154 @@ export function evidenceBucket(score) {
   return { score, mag, level, bucket, confidence };
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+   Pluggable evidence DETECTORS — domain knowledge as DATA, not branches
+   ────────────────────────────────────────────────────────────────────────
+   A detector observes a parsed transcript (and, if it wants, the raw text)
+   and reports whether a signal is present. The aggregator in analyzePair() is
+   completely generic — it knows nothing about pandas, Rust, JS, etc. Domain
+   expertise lives in detector "packs" you opt into. To make the engine smarter
+   for a new domain you ADD a detector; you never edit the core.
+
+   Each detector:
+     id        unique string
+     label     human label (shown in key differences)
+     tier      "correctness" (a proxy the fix is actually RIGHT — domain-ish)
+               "process"     (generalizes everywhere but says NOTHING about
+                              correctness: explored, ran tests, edit volume…)
+     polarity  "good" (presence is positive for that side) | "bad"
+     weight    magnitude of its contribution
+     cap?      optional clamp on its absolute contribution
+     test(parsed, rawText) -> boolean
+     weakness?(self, other) -> { code, justification } | null
+   ════════════════════════════════════════════════════════════════════════ */
+
+/** Domain-agnostic detectors — safe to run on ANY codebase/language. */
+export const GENERIC_DETECTORS = [
+  { id: "placeholderStub", label: "Placeholder/stub in final code", tier: "correctness", polarity: "bad", weight: 0.6,
+    test: p => p.placeholderTodos.length > 0,
+    weakness: s => s.placeholderTodos.length > 0
+      ? { code: "LAZY", justification: `placeholder/stub left in code ("${s.placeholderTodos[0].text}", line ${s.placeholderTodos[0].line}).` } : null },
+  { id: "unresolvedError", label: "Unresolved runtime error", tier: "correctness", polarity: "bad", weight: 0.5,
+    test: p => p.errors.length > 0,
+    weakness: s => s.errors.length > 0
+      ? { code: "FALSE", justification: `runtime error visible in transcript ("${s.errors[0].text.substring(0, 40)}") — confirm it was resolved.` } : null },
+  { id: "unverifiedSuccess", label: "Success claimed, never verified", tier: "process", polarity: "bad", weight: 0.2,
+    test: p => p.successClaims.length > 0 && !p.hasTestRun && p.commands.length === 0,
+    weakness: s => (s.successClaims.length > 0 && !s.hasTestRun && s.commands.length === 0)
+      ? { code: "VERIFY", justification: `claims success ("${s.successClaims[0].text.substring(0, 48)}") but ran no test/verification.` } : null },
+  { id: "ranTests", label: "Ran tests/verification", tier: "process", polarity: "good", weight: 0.35,
+    test: p => p.hasTestRun },
+  { id: "exploredBeforeEdit", label: "Explored before editing", tier: "process", polarity: "good", weight: 0.2,
+    test: p => p.filesExplored.length > 0 && p.filesEdited.length > 0 },
+  { id: "highChurn", label: "High self-correction churn", tier: "process", polarity: "bad", weight: 0.1, cap: 0.25,
+    test: p => p.reverts.length >= 3,
+    weakness: s => (s.reverts.length >= 3 && s.editOps > 0)
+      ? { code: "VERBOSE", justification: `high self-correction churn (${s.reverts.length} reverts/re-thinks) — weaker initial grasp. [Tiebreaker only.]` } : null },
+];
+
+/** Opt-in pandas/Koalas pack — correctness proxies specific to that domain.
+    This is exactly the kind of knowledge that does NOT belong in the core. */
+export const PANDAS_DETECTORS = [
+  { id: "inputValidation", label: "Input/length validation", tier: "correctness", polarity: "good", weight: 1.0,
+    test: p => p.hasLengthCheck,
+    weakness: (s, o) => (!s.hasLengthCheck && o.hasLengthCheck)
+      ? { code: "INST", justification: `no length/size validation, while the other side raises on mismatch — may silently produce wrong output.` } : null },
+  { id: "indexHandling", label: "Explicit index handling", tier: "correctness", polarity: "good", weight: 0.9,
+    test: p => p.hasIndexHandling,
+    weakness: (s, o) => (!s.hasIndexHandling && o.hasIndexHandling)
+      ? { code: "ROOT", justification: `no explicit index handling (reset_index/set_index/default_index_type) — can misalign values for non-default indexes.` } : null },
+];
+
 /**
- * Compare two transcripts on observable evidence and suggest a preference.
- * LEFT = first arg, RIGHT = second arg (matches the 0–7 scale orientation).
- * Returns a SUGGESTION + per-side evidence; never a final answer.
+ * Compare two transcripts using a set of DETECTORS and suggest a 0–7 bucket.
+ * LEFT = first arg, RIGHT = second arg. `opts.detectors` defaults to the
+ * domain-agnostic GENERIC pack; pass `[...GENERIC_DETECTORS, ...PANDAS_DETECTORS]`
+ * (or your own) to add domain intelligence. Returns a SUGGESTION, never a final
+ * answer — and deliberately REFUSES to claim a strong preference when the lead
+ * is carried only by process/thoroughness signals.
  */
-export function analyzePair(leftText, rightText) {
+export function analyzePair(leftText, rightText, opts = {}) {
+  const detectors = opts.detectors || GENERIC_DETECTORS;
   const L = parseTranscript(leftText);
   const R = parseTranscript(rightText);
   if (!L || !R) return null;
-  const sL = evidenceSignals(L);
-  const sR = evidenceSignals(R);
-
   const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
-  let score = 0;                                 // positive = RIGHT better
-  score += (sR.val - sL.val) * 1.0;              // input/length validation present
-  score += (sR.idx - sL.idx) * 0.9;              // explicit index handling
-  score += (sL.ph - sR.ph) * 0.6;                // genuine placeholder stubs are bad
-  score += (sL.err - sR.err) * 0.2;              // unresolved runtime errors are bad
-  score += clamp((sL.rev - sR.rev) * 0.1, -0.25, 0.25); // self-correction churn (weak tiebreak)
 
-  const band = evidenceBucket(score);
+  let score = 0;            // positive = RIGHT better
+  let correctnessScore = 0; // contribution from correctness-tier detectors ONLY
+  const detectorHits = [];
+  for (const d of detectors) {
+    const l = !!d.test(L, leftText);
+    const r = !!d.test(R, rightText);
+    if (!l && !r) continue;
+    let contrib = d.polarity === "good"
+      ? d.weight * ((r ? 1 : 0) - (l ? 1 : 0))
+      : d.weight * ((l ? 1 : 0) - (r ? 1 : 0));
+    if (d.cap) contrib = clamp(contrib, -d.cap, d.cap);
+    score += contrib;
+    if (d.tier === "correctness") correctnessScore += contrib;
+    detectorHits.push({ id: d.id, label: d.label, tier: d.tier, left: l, right: r, contrib: +contrib.toFixed(3) });
+  }
 
-  // Asymmetry-aware draft weaknesses (only flag when the OTHER side has the safeguard).
-  const weak = (self, other, sideLabel, otherLabel) => {
-    const w = [];
-    if (self.placeholderTodos.length > 0)
-      w.push({ code: "LAZY", justification: `${sideLabel}: placeholder/stub left in code ("${self.placeholderTodos[0].text}", line ${self.placeholderTodos[0].line}) — implementation looks incomplete.` });
-    if (!self.hasLengthCheck && other.hasLengthCheck)
-      w.push({ code: "INST", justification: `${sideLabel}: no length/size validation, while ${otherLabel} raises on mismatch. Reference libraries error on length mismatch — may silently produce wrong output.` });
-    if (!self.hasIndexHandling && other.hasIndexHandling)
-      w.push({ code: "ROOT", justification: `${sideLabel}: no explicit index handling (reset_index/set_index/default_index_type) vs ${otherLabel}. Converting input without positional alignment can misalign values for non-default indexes.` });
-    if (self.successClaims.length > 0 && !self.hasTestRun && self.commands.length === 0)
-      w.push({ code: "VERIFY", justification: `${sideLabel}: claims success ("${self.successClaims[0].text.substring(0, 48)}") but ran no test/verification.` });
-    if (self.successClaims.length > 0 && self.errors.length > 0)
-      w.push({ code: "FALSE", justification: `${sideLabel}: asserts success but ${self.errors.length} runtime error line(s) appear (e.g. "${self.errors[0].text.substring(0, 40)}").` });
-    if (self.reverts.length >= 3 && self.editOps > 0)
-      w.push({ code: "VERBOSE", justification: `${sideLabel}: high self-correction churn (${self.reverts.length} reverts/re-thinks) — weaker initial grasp. [Tiebreaker only.]` });
-    return w;
-  };
+  // Weaknesses come from the detectors themselves — no hard-coded domain branches.
+  const collectWeak = (self, other) =>
+    detectors.map(d => (d.weakness ? d.weakness(self, other) : null)).filter(Boolean);
+  const weakLeft = collectWeak(L, R);
+  const weakRight = collectWeak(R, L);
+
+  // ── Calibration: thoroughness is not correctness ──
+  // If the margin is carried by PROCESS signals (tests run, exploration, edit
+  // volume) rather than CORRECTNESS evidence, refuse to claim more than a
+  // marginal lean and drop confidence. A confident, well-tested WRONG fix must
+  // not outrank a terse correct one.
+  const cautions = [];
+  const processLed = Math.abs(correctnessScore) < 0.5 && Math.abs(score) >= 0.3;
+  if (processLed) {
+    cautions.push(
+      "Lead is driven by process/thoroughness signals (tests run, exploration, edit volume), NOT correctness evidence. A confident, well-tested WRONG fix can outscore a terse correct one — read the diff before trusting this."
+    );
+  }
+  if ((L.successClaims.length > 0) !== (R.successClaims.length > 0)) {
+    const side = L.successClaims.length > 0 ? "LEFT" : "RIGHT";
+    cautions.push(`${side} asserts success and the other does not — a success claim is not evidence of correctness; verify against the actual code.`);
+  }
+
+  let { bucket, confidence } = evidenceBucket(score);
+  if (processLed) {
+    confidence = "low";
+    bucket = score > 0.15 ? 4 : score < -0.15 ? 3 : null; // marginal at most
+  } else {
+    // Confidence should track the CORRECTNESS margin, not raw thoroughness.
+    confidence = evidenceBucket(correctnessScore || score).confidence;
+  }
 
   const cmp = (name, a, b) => (a !== b ? `${name}: LEFT=${a}, RIGHT=${b}` : null);
   const keyDifferences = [
     cmp("Files edited", L.filesEdited.length, R.filesEdited.length),
     cmp("Edit ops", L.editOps, R.editOps),
-    cmp("Length validation", sL.val ? "yes" : "no", sR.val ? "yes" : "no"),
-    cmp("Index handling", sL.idx ? "yes" : "no", sR.idx ? "yes" : "no"),
-    cmp("Placeholder stubs", sL.ph, sR.ph),
-    cmp("Self-corrections", sL.rev, sR.rev),
-    cmp("Runtime errors", sL.err, sR.err),
+    cmp("Ran tests", L.hasTestRun ? "yes" : "no", R.hasTestRun ? "yes" : "no"),
+    cmp("Placeholder stubs", L.placeholderTodos.length, R.placeholderTodos.length),
+    cmp("Self-corrections", L.reverts.length, R.reverts.length),
+    cmp("Runtime errors", L.errors.length, R.errors.length),
+    ...detectors
+      .filter(d => d.tier === "correctness" && (d.test(L, leftText) || d.test(R, rightText)))
+      .map(d => cmp(d.label, d.test(L, leftText) ? "yes" : "no", d.test(R, rightText) ? "yes" : "no")),
   ].filter(Boolean);
 
   return {
     parsedLeft: L,
     parsedRight: R,
-    score,
-    bucket: band.bucket,
-    level: band.level,
-    confidence: band.confidence,
-    suggestedLabel: band.bucket === null ? "Too close to call from evidence" : SCALE[band.bucket].label,
-    weakLeft: weak(L, R, "LEFT", "RIGHT"),
-    weakRight: weak(R, L, "RIGHT", "LEFT"),
+    score: +score.toFixed(3),
+    correctnessScore: +correctnessScore.toFixed(3),
+    bucket,
+    confidence,
+    detectorHits,
+    cautions,
+    suggestedLabel: bucket === null ? "Too close to call from evidence" : SCALE[bucket].label,
+    weakLeft,
+    weakRight,
     keyDifferences: keyDifferences.length ? keyDifferences : ["No structural differences detected — compare final code manually."],
-    note: "Suggestion from observable structure only (validation, index handling, stubs, churn, errors). It cannot judge semantic correctness — read the diff and fill the worksheet yourself.",
+    note: "Suggestion from observable structure via pluggable detectors. The core is domain-agnostic; correctness detectors are an opt-in pack. It cannot read semantics — confirm by reading the diff.",
   };
 }

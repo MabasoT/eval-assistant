@@ -259,7 +259,7 @@ This clears the stale timer before scheduling a new one.
 
 const HARD_RIGHT = `
 ### Tool: bash_exploration_tool
-**search_command:** \`grep -rn "debounce" /src\`
+**search_command:** \`grep -rn "debounce" /src/index.js\`
 
 ### View \`/src/debounce.js\`
 ### View \`/src/handlers.js\`

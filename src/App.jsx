@@ -9,6 +9,8 @@ import {
   suggestBucket,
   maxWeighted,
   totalWeight,
+  parseTranscript,
+  analyzePair,
 } from "./scoring.js";
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -36,82 +38,9 @@ const MIN_RATIONALE_CHARS = 50;       // shared rationale minimum (confirmed by 
    (blankWorksheet, weightedTotal, worksheetComplete, suggestBucket, …) live in
    ./scoring.js so they can be unit-tested in isolation. See scoring.test.js. */
 
-/* ───── Transcript Parser (READING AID ONLY — never auto-populates answers) ─────
-   Scans a pasted transcript for structural signals (tool calls, files, TODOs,
-   success claims, errors) to help you locate evidence faster. */
-function parseTranscript(text) {
-  if (!text.trim()) return null;
-  const lines = text.split("\n");
-  const toolCalls = [];
-  const filesEdited = new Set();
-  const filesRead = new Set();
-  const commands = [];
-  const todos = [];
-  const successClaims = [];
-  const errors = [];
-
-  const toolPatterns = [
-    /str_replace|str_replace_editor/i,
-    /create_file|file_edit|write_file/i,
-    /read_file|view_file|cat\s/i,
-    /grep|find\s|rg\s|ag\s/i,
-    /bash|execute|terminal|shell/i,
-    /search|list_dir/i,
-  ];
-
-  const filePattern = /(?:(?:\/[\w.-]+)+(?:\.[\w]+)?)|(?:[\w.-]+\.(?:py|js|ts|jsx|tsx|rs|go|rb|java|c|cpp|h|hpp|css|html|json|yaml|yml|toml|md|txt|cfg|ini|sh|sql))/g;
-  const todoPattern = /(?:TODO|FIXME|XXX|HACK|placeholder|implement\s+this|pass\s*#|\.\.\.(?:\s*#|\s*$))/gi;
-  const successPattern = /(?:successfully|completed|all tests pass|this (?:should|will) (?:fix|work|resolve)|fix(?:ed|es) the (?:issue|bug|problem)|changes are (?:complete|done))/gi;
-  const errorPattern = /(?:error|Error|ERROR|traceback|Traceback|exception|Exception|failed|FAILED|panic|PANIC)/g;
-  const editPatterns = /(?:str_replace|create_file|file_edit|write_file|insert_text|patch)/i;
-  const readPatterns = /(?:read_file|view_file|cat |head |tail |less )/i;
-  const bashContent = /```(?:bash|sh|shell)?\n([\s\S]*?)```/gi;
-
-  let match;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    for (const pat of toolPatterns) {
-      if (pat.test(line)) {
-        toolCalls.push({ line: i + 1, text: line.trim().substring(0, 120) });
-        break;
-      }
-    }
-    if (editPatterns.test(line)) {
-      const files = line.match(filePattern);
-      if (files) files.forEach(f => filesEdited.add(f));
-    }
-    if (readPatterns.test(line)) {
-      const files = line.match(filePattern);
-      if (files) files.forEach(f => filesRead.add(f));
-    }
-    while ((match = todoPattern.exec(line)) !== null) {
-      todos.push({ line: i + 1, text: line.trim().substring(0, 100) });
-    }
-    while ((match = successPattern.exec(line)) !== null) {
-      successClaims.push({ line: i + 1, text: line.trim().substring(0, 100) });
-    }
-    while ((match = errorPattern.exec(line)) !== null) {
-      errors.push({ line: i + 1, text: line.trim().substring(0, 100) });
-    }
-  }
-
-  while ((match = bashContent.exec(text)) !== null) {
-    commands.push(match[1].trim().substring(0, 120));
-  }
-
-  return {
-    toolCallCount: toolCalls.length,
-    toolCalls: toolCalls.slice(0, 30),
-    filesEdited: [...filesEdited].slice(0, 20),
-    filesRead: [...filesRead].slice(0, 20),
-    commands: [...new Set(commands)].slice(0, 15),
-    todos,
-    successClaims,
-    errors: errors.slice(0, 20),
-    lineCount: lines.length,
-    charCount: text.length,
-  };
-}
+/* parseTranscript() + analyzePair() (the evidence engine) live in ./scoring.js
+   so they are pure and unit-tested (see scoring.test.js). The parser is a
+   READING AID and the suggestion is ADVISORY — neither auto-fills your answers. */
 
 /* ───── Snippets for quick-fill (manual aids — you still write the substance) ───── */
 const STRENGTH_SNIPPETS = [
@@ -203,9 +132,13 @@ function ParsedView({ parsed }) {
     <div style={{ fontSize: 12, fontFamily: "var(--mono)", lineHeight: 1.8, color: "#4a5568" }}>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
         <Badge text={`${parsed.toolCallCount} tool calls`} />
+        <Badge text={`${parsed.editOps} edit ops`} color="#8a5a1a" bg="#fef8e8" />
         <Badge text={`${parsed.filesEdited.length} files edited`} color="#8a5a1a" bg="#fef8e8" />
         <Badge text={`${parsed.lineCount} lines`} color="#5a5a8a" bg="#f0f0fa" />
-        {parsed.todos.length > 0 && <Badge text={`${parsed.todos.length} TODOs !`} color="#c44" bg="#fef2f0" />}
+        {parsed.hasLengthCheck && <Badge text="length-check ✓" color="#1a7a3a" bg="#e8f5ee" />}
+        {parsed.hasIndexHandling && <Badge text="index-handling ✓" color="#1a7a3a" bg="#e8f5ee" />}
+        {parsed.reverts.length > 0 && <Badge text={`${parsed.reverts.length} self-corrections`} color="#8a6a10" bg="#fef8e8" />}
+        {parsed.placeholderTodos.length > 0 && <Badge text={`${parsed.placeholderTodos.length} placeholders !`} color="#c44" bg="#fef2f0" />}
         {parsed.successClaims.length > 0 && <Badge text={`${parsed.successClaims.length} success claims`} color="#8a6a10" bg="#fef8e8" />}
         {parsed.errors.length > 0 && <Badge text={`${parsed.errors.length} errors`} color="#c44" bg="#fef2f0" />}
       </div>
@@ -234,6 +167,52 @@ function ParsedView({ parsed }) {
         </div>
       )}
     </div>
+  );
+}
+
+/* ───── Evidence-based suggestion (ADVISORY — opt-in, never auto-fills) ─────
+   Wraps analyzePair() from the engine. Shows a suggested 0–7 bucket from
+   OBSERVABLE structure (validation, index handling, stubs, churn, errors),
+   plus the per-side draft weaknesses and key differences. You confirm or
+   override everything in the worksheet — this never writes your answers. */
+function SuggestionCard({ left, right }) {
+  const [shown, setShown] = useState(false);
+  const ready = left.trim() && right.trim();
+  const a = shown && ready ? analyzePair(left, right) : null;
+  return (
+    <Card tag="HINT" title="Evidence-based suggestion (advisory)" right={
+      <Btn small onClick={() => setShown(s => !s)} disabled={!ready}>{shown ? "Hide" : ready ? "Show suggestion" : "Paste both first"}</Btn>
+    }>
+      {!shown ? (
+        <p style={{ fontSize: 11.5, color: "#6b7280", margin: 0 }}>
+          Compares LEFT vs RIGHT on signals a parser can actually see — input/length validation, index handling, placeholder stubs, self-correction churn, runtime errors — and proposes a bucket. It cannot judge semantic correctness; confirm in the worksheet.
+        </p>
+      ) : a ? (
+        <div style={{ fontSize: 12, color: "#4a5568", lineHeight: 1.6 }}>
+          <div style={{ marginBottom: 8 }}>
+            <strong>Suggested:</strong>{" "}
+            {a.bucket === null
+              ? <Badge text="Too close to call" color="#8a6a10" bg="#fef8e8" />
+              : <Badge text={`${a.bucket} — ${SCALE[a.bucket].label}`} color={SCALE[a.bucket].c} bg="#f4f5f7" />}
+            <span style={{ marginLeft: 8, fontSize: 11, color: "#9ca3af" }}>confidence: {a.confidence} (score {a.score.toFixed(2)})</span>
+          </div>
+          <div style={{ marginBottom: 8 }}>
+            <strong>Key differences:</strong>
+            {a.keyDifferences.map((d, i) => <div key={i} style={{ paddingLeft: 10, fontFamily: "var(--mono)", fontSize: 11 }}>* {d}</div>)}
+          </div>
+          {(a.weakLeft.length > 0 || a.weakRight.length > 0) && (
+            <div style={{ marginBottom: 8 }}>
+              <strong>Draft issues to verify:</strong>
+              {a.weakLeft.map((w, i) => <div key={"l" + i} style={{ paddingLeft: 10, fontSize: 11 }}><code style={{ color: "#993333" }}>{w.code}</code> {w.justification}</div>)}
+              {a.weakRight.map((w, i) => <div key={"r" + i} style={{ paddingLeft: 10, fontSize: 11 }}><code style={{ color: "#993333" }}>{w.code}</code> {w.justification}</div>)}
+            </div>
+          )}
+          <div style={{ padding: 8, background: "#fef8e8", borderRadius: 6, fontSize: 11 }}>{"💡"} {a.note}</div>
+        </div>
+      ) : (
+        <p style={{ fontSize: 12, color: "#9ca3af", margin: 0 }}>Paste both transcripts on the Paste step first.</p>
+      )}
+    </Card>
   );
 }
 
@@ -770,6 +749,7 @@ ${rationale}`;
         {/* STEP 1: WORKSHEET */}
         {step === 1 && (
           <>
+            <SuggestionCard left={transcriptLeft} right={transcriptRight} />
             <WorksheetView worksheet={worksheet} setScore={setScore} dimensions={dimensions} />
             <div style={{ display: "flex", gap: 8 }}>
               <Btn onClick={() => setStep(0)}>{"←"} Back</Btn>

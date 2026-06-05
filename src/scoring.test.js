@@ -19,6 +19,10 @@ import {
   weightedTotal,
   worksheetComplete,
   suggestBucket,
+  parseTranscript,
+  evidenceSignals,
+  evidenceBucket,
+  analyzePair,
 } from "./scoring.js";
 
 /* A small fixed dimension set we control, so tests don't depend on the
@@ -102,4 +106,116 @@ test("suggestBucket magnitude band boundaries are correct", () => {
   assert.equal(suggestBucket(54, 30).bucket, 1); // diff +24
   // mag > 24 → strongly (level 3): LEFT 0, RIGHT 7
   assert.equal(suggestBucket(55, 30).bucket, 0); // diff +25
+});
+
+/* ════════════════════════════════════════════════════════════════════════
+   Transcript parser + evidence-based suggestion engine
+   Fixtures distilled from a real Koalas eval: "Column assignment doesn't
+   support type list". LEFT converts the list to a Series (no length check, no
+   index handling, messy/self-correcting); RIGHT validates length and assigns
+   positionally via reset_index/set_index + option_context (the canonical fix).
+   ════════════════════════════════════════════════════════════════════════ */
+const LEFT_TX = `
+### Tool: bash_exploration_tool
+**search_command:** \`grep -n "Column assignment" /repo/databricks/koalas/frame.py\`
+
+### View \`/repo/databricks/koalas/frame.py\`
+
+Wait, the issue is supporting list, not rejecting it. Let me re-think.
+
+### Edit \`/repo/databricks/koalas/frame.py\`
+**Replace:**
+\`\`\`python
+def __setitem__(self, key, value):
+\`\`\`
+**With:**
+\`\`\`python
+def __setitem__(self, key, value):
+    if is_list_like(value) and not isinstance(value, (DataFrame, Series, spark.Column)):
+        value = Series(value)
+\`\`\`
+
+Let me revert the earlier MultiIndex change to the original approach.
+
+### Edit \`/repo/databricks/koalas/frame.py\`
+The file /repo/databricks/koalas/frame.py has been edited successfully.
+Lists will now be converted to Series. The change looks good.
+`;
+
+const RIGHT_TX = `
+### Tool: bash_exploration_tool
+**search_command:** \`grep -n "__setitem__" /repo/databricks/koalas/frame.py\`
+
+### View \`/repo/databricks/koalas/frame.py\`
+
+### Edit \`/repo/databricks/koalas/frame.py\`
+**With:**
+\`\`\`python
+elif isinstance(value, list):
+    if len(self) != len(value):
+        raise ValueError("Length of values does not match length of index")
+    # TODO: avoid using default index?
+    with option_context(
+        "compute.default_index_type", "distributed-sequence",
+        "compute.ops_on_diff_frames", True,
+    ):
+        kdf = self.reset_index()
+        kdf[key] = ks.DataFrame(value)
+        kdf = kdf.set_index(kdf.columns[: self._internal.index_level])
+        kdf.index.names = self.index.names
+\`\`\`
+The file /repo/databricks/koalas/frame.py has been edited successfully.
+`;
+
+test("parseTranscript detects agent-markdown edits (### Edit) and file paths", () => {
+  const p = parseTranscript(LEFT_TX);
+  assert.ok(p.editOps >= 1, "should count ### Edit ops");
+  assert.ok(p.filesEdited.includes("/repo/databricks/koalas/frame.py"), "should capture edited path");
+});
+
+test("parseTranscript flags input validation and index handling on the RIGHT fix", () => {
+  const r = parseTranscript(RIGHT_TX);
+  assert.equal(r.hasLengthCheck, true);
+  assert.equal(r.hasIndexHandling, true);
+});
+
+test("parseTranscript does NOT see validation/index handling in the LEFT fix", () => {
+  const l = parseTranscript(LEFT_TX);
+  assert.equal(l.hasLengthCheck, false);
+  assert.equal(l.hasIndexHandling, false);
+});
+
+test("parseTranscript splits benign design-note TODOs from real placeholder stubs", () => {
+  const r = parseTranscript(RIGHT_TX);
+  // "# TODO: avoid using default index?" is a design note, NOT laziness.
+  assert.equal(r.placeholderTodos.length, 0);
+  assert.ok(r.benignTodos.length >= 1);
+});
+
+test("parseTranscript counts self-correction / thrash on the LEFT transcript", () => {
+  const l = parseTranscript(LEFT_TX);
+  assert.ok(l.reverts.length >= 3, `expected >=3 reverts, got ${l.reverts.length}`);
+});
+
+test("evidenceBucket maps a strong RIGHT advantage to the RIGHT 'preferred' band", () => {
+  assert.equal(evidenceBucket(2.15).bucket, 6);
+  assert.equal(evidenceBucket(-2.15).bucket, 1); // mirror
+  assert.equal(evidenceBucket(0).bucket, null);  // too close to call
+});
+
+test("analyzePair suggests RIGHT preferred (bucket 6) on the Koalas task", () => {
+  const a = analyzePair(LEFT_TX, RIGHT_TX);
+  assert.equal(a.bucket, 6, `expected bucket 6, got ${a.bucket} (score ${a.score})`);
+  // RIGHT's safeguards should surface as LEFT weaknesses…
+  const leftCodes = a.weakLeft.map(w => w.code);
+  assert.ok(leftCodes.includes("INST"), "LEFT should be flagged for missing length check");
+  assert.ok(leftCodes.includes("ROOT"), "LEFT should be flagged for missing index handling");
+  // …and RIGHT should not be flagged for laziness on the benign TODO.
+  assert.ok(!a.weakRight.some(w => w.code === "LAZY"), "RIGHT must not be flagged LAZY for a design-note TODO");
+});
+
+test("analyzePair is orientation-consistent (swapping sides mirrors the bucket)", () => {
+  const ab = analyzePair(LEFT_TX, RIGHT_TX).bucket;   // 6 (RIGHT better)
+  const ba = analyzePair(RIGHT_TX, LEFT_TX).bucket;   // 1 (LEFT better)
+  assert.equal(ab + ba, 7, "mirrored buckets should sum to 7");
 });

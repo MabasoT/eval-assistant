@@ -50,6 +50,8 @@ RULES:
   claims of success ("all tests pass") unless the diff supports them.
 - Cite specific evidence (file/line/quote) for every judgment.
 - Apply the SAME scrutiny to both sides (symmetry).
+- Write the rationale like an experienced human reviewer: first person where natural,
+  plain and direct, naming concrete files/methods. No generic praise, no filler.
 - If you genuinely cannot tell which is correct from the given material, say so
   with a near-zero score and low confidence — do NOT guess.
 
@@ -311,6 +313,14 @@ export function buildDraftPrompt({ task, responseA, responseB, dimensions, taxon
   const wsLegend = (dimensions || []).map(d => `${d.key} = ${d.label} (${d.desc})`).join("; ");
   const system = `You are a rigorous, impartial code-evaluation judge. Read BOTH responses and draft a COMPLETE evaluation form.
 Judge CORRECTNESS of the FINAL code first — hunt subtle bugs (off-by-one, wrong index/alignment, races, edge cases, error-swallowing). A confident, well-tested WRONG fix is still wrong. Judge the final code, not the journey. Cite specific evidence. Apply the same scrutiny to both sides.
+
+VOICE — write like an EXPERIENCED HUMAN REVIEWER, not an AI:
+- First person where natural ("A goes straight for the error string", "I'm not flagging the TODO", "based on what I see").
+- Plain, direct sentences; vary the rhythm; a little blunt is fine. Sound like a senior engineer talking, not a press release.
+- Always name concrete things: file names, method names (e.g. _assign / __setitem__), line refs, function/arg names, the actual code.
+- NO generic praise ("elegant", "demonstrates deep understanding", "best practices"), NO marketing words, NO filler, NO hedging.
+  GOOD: "A used grep to find the error in frame.py, read _assign and __setitem__, then made one scoped edit."
+  BAD:  "The model did a great job solving the problem efficiently and elegantly."
 
 Worksheet dimensions to score 1 (poor) … 5 (excellent), per side: ${wsLegend}
 

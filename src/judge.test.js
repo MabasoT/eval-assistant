@@ -19,6 +19,7 @@ import {
   runJudge,
   parseDraftResponse,
   runDraft,
+  buildDraftPrompt,
 } from "./judge.js";
 import { DEFAULT_DIMENSIONS, DEFAULT_TAXONOMY } from "./scoring.js";
 
@@ -164,6 +165,18 @@ test("runJudge throws a clear error when no model adapter is supplied", async ()
 });
 
 /* ───── full-form auto-draft ───── */
+test("buildDraftPrompt asks for an experienced human voice and embeds both responses", () => {
+  const { system, user } = buildDraftPrompt({
+    task: "fix it", responseA: "AAA", responseB: "BBB",
+    dimensions: DEFAULT_DIMENSIONS, taxonomy: DEFAULT_TAXONOMY,
+  });
+  assert.match(system, /EXPERIENCED HUMAN REVIEWER/i);
+  assert.match(system, /No generic praise/i);
+  assert.match(system, /CORRECTNESS/i);
+  assert.match(user, /=== RESPONSE A ===[\s\S]*AAA/);
+  assert.match(user, /=== RESPONSE B ===[\s\S]*BBB/);
+});
+
 test("parseDraftResponse validates codes, clamps scores, keeps every dimension", () => {
   const raw = JSON.stringify({
     strengthA: "a", strengthB: "b",
